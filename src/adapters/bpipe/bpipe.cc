@@ -1,4 +1,4 @@
-﻿#include "bpipe.h"
+#include "bpipe.h"
 
 #include <blpapi_correlationid.h>
 #include <blpapi_element.h>
@@ -14,8 +14,7 @@ static const bbg::Name kBid("BID");
 static const bbg::Name kAsk("ASK");
 static const bbg::Name kAskSize("ASK_SIZE");
 static const bbg::Name kBidSize("BID_SIZE");
-static const bbg::Name kPxLast("PX_LAST");
-static const bbg::Name kLastTrade("LAST_TRADE");
+static const bbg::Name kLastPrice("LAST_PRICE");
 static const bbg::Name kSizeLastTrade("SIZE_LAST_TRADE");
 static const bbg::Name kBestAsks[] = {
     bbg::Name{"BEST_ASK1"}, bbg::Name{"BEST_ASK2"}, bbg::Name{"BEST_ASK3"},
@@ -111,31 +110,34 @@ void BPIPE::Start() noexcept {
   Reconnect();
 }
 
+void BPIPE::Close() {
+  connected_ = 0;
+  if (session_) {
+    session_->stop();
+    delete session_;  // release fd
+    session_ = nullptr;
+  }
+}
+
+void BPIPE::Stop() noexcept {
+  tp_.AddTask([this]() { Close(); });
+}
+
 void BPIPE::Reconnect() noexcept {
   tp_.AddTask([this]() {
-    connected_ = 0;
-    if (session_) {
-      session_->stop();
-      delete session_;  // release fd
-    }
+    if (connected_ == -1) return;
+    Close();
+    connected_ = -1;
     session_ = new bbg::Session(options_, this);
     session_->startAsync();
   });
 }
 
-void BPIPE::Subscribe(const opentrade::Security& sec) noexcept {
-  tp_.AddTask([this, &sec] {
-    if (!subs_.insert(&sec).second) return;
-    if (!connected()) return;
-    Subscribe2(sec);
-  });
-}
-
-void BPIPE::Subscribe2(const opentrade::Security& sec) {
+void BPIPE::SubscribeSync(const opentrade::Security& sec) noexcept {
   bbg::SubscriptionList sub;
   std::string symbol("//blp/mktdata/bbgid/");
   symbol += sec.bbgid;
-  std::string fields = "LAST_TRADE,SIZE_LAST_TRADE,BID,BID_SIZE,ASK,ASK_SIZE,";
+  std::string fields = "LAST_PRICE,SIZE_LAST_TRADE,BID,BID_SIZE,ASK,ASK_SIZE,";
   auto depth =
       "BEST_BID1,BEST_BID2,BEST_BID3,BEST_BID4,BEST_BID5,"
       "BEST_BID1_SZ,BEST_BID2_SZ,BEST_BID3_SZ,BEST_BID4_SZ,BEST_BID5_SZ,"
@@ -143,9 +145,11 @@ void BPIPE::Subscribe2(const opentrade::Security& sec) {
       "BEST_ASK1_SZ,BEST_ASK2_SZ,BEST_ASK3_SZ,BEST_ASK4_SZ,BEST_ASK5_SZ";
   if (depth_) fields += depth;
 
-  auto ticker = ++ticker_counter_;
+  auto ticker = ++request_counter_;
   tickers_[ticker] = &sec;
   sub.add(symbol.c_str(), fields.c_str(), "", bbg::CorrelationId(ticker));
+  LOG_INFO(name() << ": subscribe to " << sec.exchange->name << ":"
+                  << sec.symbol << " " << symbol << " " << fields);
   session_->subscribe(sub, identity_);
 }
 
@@ -197,7 +201,10 @@ void BPIPE::ProcessSessionStatus(const bbg::Event& evt) {
     } else if (msg.messageType() == "SessionTerminated" ||
                msg.messageType() == "SessionConnectionDown" ||
                msg.messageType() == "SessionStartupFailure") {
+      if (!connected_) return;
       connected_ = 0;
+      LOG_INFO(name() << ": " << msg << ", will reconnect in "
+                      << reconnect_interval_ << 's');
       tp_.AddTask([this]() { Reconnect(); },
                   boost::posix_time::seconds(reconnect_interval_));
     }
@@ -208,6 +215,8 @@ void BPIPE::ProcessSessionStatus(const bbg::Event& evt) {
 void BPIPE::OnConnect() {
   if (!session_->openService("//blp/apiauth")) return;
   auth_service_ = session_->getService("//blp/apiauth");
+  if (!session_->openService("//blp/mktdata"))
+    session_->getService("//blp/mktdata");
 
   identity_ = session_->createIdentity();
   LOG_INFO(name() << ": Generate token from session");
@@ -222,7 +231,7 @@ void BPIPE::ProcessResponse(const bbg::Event& evt) {
     if (msg_type == "AuthorizationSuccess") {
       tp_.AddTask([this]() {
         connected_ = 1;
-        for (auto sec : subs_) Subscribe2(*sec);
+        ReSubscribeAll();
       });
       LOG_INFO(name() << ": Connected");
     } else if (msg_type == "AuthorizationFailure") {
@@ -272,8 +281,8 @@ void BPIPE::ProcessSubscriptionData(const bbg::Event& evt) {
     if (!sec) continue;
     auto px = 0.;
     auto sz = 0.;
-    if (msg.hasElement(kLastTrade, true)) {
-      px = msg.getElementAsFloat64(kLastTrade);
+    if (msg.hasElement(kLastPrice, true)) {
+      px = msg.getElementAsFloat64(kLastPrice);
       if (msg.hasElement(kSizeLastTrade, true))
         sz = msg.getElementAsInt64(kSizeLastTrade);
     }
@@ -298,8 +307,8 @@ void BPIPE::ProcessTokenStatus(const bbg::Event& evt) {
       LOG_INFO(name() << ": TokenGenerationSuccess");
       auto req = auth_service_.createAuthorizationRequest();
       req.set("token", msg.getElementAsString("token"));
-      session_->sendAuthorizationRequest(req, &identity_,
-                                         bbg::CorrelationId(++ticker_counter_));
+      session_->sendAuthorizationRequest(
+          req, &identity_, bbg::CorrelationId(++request_counter_));
     } else if (msg.messageType() == "TokenGenerationFailure") {
       LOG_ERROR(name() << ": TokenGenerationFailure");
     }

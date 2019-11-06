@@ -1,13 +1,6 @@
 file(GLOB SRC_FILES *.cc)
-
-add_executable(${PROJECT_NAME} ${SRC_FILES})
-
-target_link_libraries(${PROJECT_NAME}
-  ${LOG4CXX_LIBRARY_PATH}
-  ${QUICKFIX_LIBRARY_PATH}
-  ${SOCI_CORE_LIBRARY_PATH}
-  ${SOCI_POSTGRES_LIBRARY_PATH}
-  ${TBB_LIBRARY_PATH}
-  ${Boost_LIBRARIES}
-  dl pthread crypto
-)
+link_directories(${CMAKE_BINARY_DIR}/${PROJECT_NAME})
+list(REMOVE_ITEM SRC_FILES main.cc)
+add_library(${PROJECT_NAME}_static STATIC ${SRC_FILES})
+add_executable(${PROJECT_NAME} main.cc)
+target_link_libraries(${PROJECT_NAME} ${EXE_DEPS})

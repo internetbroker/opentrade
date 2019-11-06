@@ -1,3 +1,4 @@
 file(GLOB_RECURSE SRC_FILES *.cc)
-add_library(fix42 MODULE ${SRC_FILES})
-target_link_libraries(fix42 ${QUICKFIX_LIBRARY_PATH})
+get_filename_component(name ${CMAKE_CURRENT_SOURCE_DIR} NAME)
+add_library(${name} MODULE ${SRC_FILES})
+target_link_libraries(${name} ${QUICKFIX_LIBRARY_PATH})

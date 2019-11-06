@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from ws4py.client.threadedclient import WebSocketClient
 import json
@@ -27,7 +27,7 @@ def openWs():
 
 
 def login():
-  login = ['login', "test", 'test']
+  login = ['login', 'test', 'test']
   ws = openWs()
   ws.send(json.dumps(login))
   return ws

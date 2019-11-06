@@ -1,1 +1,7 @@
+subdirlist(SUBDIRS)
 add_subdirectory(twap)
+foreach(SUBDIR ${SUBDIRS})
+  IF(NOT ${SUBDIR} MATCHES "twap")
+    add_subdirectory(${SUBDIR})
+  endif()
+endforeach()

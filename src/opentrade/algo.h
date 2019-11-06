@@ -10,10 +10,10 @@
 #include <fstream>
 #include <list>
 #include <mutex>
-#include <set>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -50,6 +50,7 @@ struct ParamDef {
   double min_value = 0;
   double max_value = 0;
   int precision = 0;
+  bool editable = false;
 };
 
 typedef std::vector<ParamDef> ParamDefs;
@@ -61,33 +62,43 @@ class Algo : public Adapter {
   typedef std::unordered_map<std::string, ParamDef::Value> ParamMap;
   typedef std::shared_ptr<ParamMap> ParamMapPtr;
   void SetTimeout(std::function<void()> func, double seconds);
+  void Async(std::function<void()> func) { SetTimeout(func, 0); }
   static bool Cancel(const Order& ord);
 
-  virtual std::string OnStart(const ParamMap& params) noexcept = 0;
-  virtual void OnModify(const ParamMap& params) noexcept = 0;
-  virtual void OnStop() noexcept = 0;
+  virtual std::string OnStart(const ParamMap& params) noexcept { return {}; }
+  virtual void OnModify(const ParamMap& params) noexcept {}
+  virtual void OnStop() noexcept {}
   virtual void OnMarketTrade(const Instrument& inst, const MarketData& md,
-                             const MarketData& md0) noexcept = 0;
+                             const MarketData& md0) noexcept {}
   virtual void OnMarketQuote(const Instrument& inst, const MarketData& md,
-                             const MarketData& md0) noexcept = 0;
-  virtual void OnConfirmation(const Confirmation& cm) noexcept = 0;
-  virtual const ParamDefs& GetParamDefs() noexcept = 0;
+                             const MarketData& md0) noexcept {}
+  // for cross order, only kUnconfirmedNew and kFilled
+  virtual void OnConfirmation(const Confirmation& cm) noexcept {}
+  virtual const ParamDefs& GetParamDefs() noexcept {
+    static const ParamDefs kEmptyParamDefs;
+    return kEmptyParamDefs;
+  }
+  virtual void OnIndicator(Indicator::IdType id,
+                           const Instrument& inst) noexcept {}
 
   virtual std::string Test() noexcept {
     assert(false);
     return {};
   }
 
+  // initialize global variable here.
+  // only called once when loading .so
   void Start() noexcept override {}
 
   bool is_active() const { return is_active_; }
   IdType id() const { return id_; }
   const std::string& token() const { return token_; }
   const User& user() const { return *user_; }
+  void set_user(const User* user) { user_ = user; }
 
  protected:
-  Instrument* Subscribe(const Security& sec, DataSrc src = DataSrc{},
-                        bool listen = true);
+  Instrument* Subscribe(const Security& sec, DataSrc src = {},
+                        bool listen = true, Instrument* parent = nullptr);
   void Stop();
   Order* Place(const Contract& contract, Instrument* inst);
   void Cross(double qty, double price, OrderSide side, const SubAccount* acc,
@@ -98,18 +109,20 @@ class Algo : public Adapter {
   bool is_active_ = true;
   IdType id_ = 0;
   std::string token_;
-  std::set<Instrument*> instruments_;
+  std::unordered_set<Instrument*> instruments_;
   friend class AlgoManager;
   friend class Backtest;
 };
 
 class Instrument {
  public:
-  typedef std::set<Order*> Orders;
+  typedef std::unordered_set<Order*> Orders;
   Instrument(Algo* algo, const Security& sec, DataSrc src)
       : algo_(algo), sec_(sec), src_(src) {}
   Algo& algo() { return *algo_; }
   const Algo& algo() const { return *algo_; }
+  const Instrument* parent() const { return parent_; }
+  auto src_idx() const { return src_idx_; }
   const Security& sec() const { return sec_; }
   DataSrc src() const { return src_; }
   const MarketData& md() const { return *md_; }
@@ -118,18 +131,18 @@ class Instrument {
   double sold_qty() const { return sold_qty_; }
   double outstanding_buy_qty() const { return outstanding_buy_qty_; }
   double outstanding_sell_qty() const { return outstanding_sell_qty_; }
-  double net_qty() const { return bought_qty_ - sold_qty_; }
-  double net_cx_qty() const { return bought_cx_qty_ - sold_cx_qty_; }
-  double total_qty() const { return bought_qty_ + sold_qty_; }
-  double total_cx_qty() const { return bought_cx_qty_ + sold_cx_qty_; }
+  double net_qty() const { return Round6(bought_qty_ - sold_qty_); }
+  double net_cx_qty() const { return Round6(bought_cx_qty_ - sold_cx_qty_); }
+  double total_qty() const { return Round6(bought_qty_ + sold_qty_); }
+  double total_cx_qty() const { return Round6(bought_cx_qty_ + sold_cx_qty_); }
   double net_outstanding_qty() const {
-    return outstanding_buy_qty_ - outstanding_sell_qty_;
+    return Round6(outstanding_buy_qty_ - outstanding_sell_qty_);
   }
   double total_outstanding_qty() const {
-    return outstanding_buy_qty_ + outstanding_sell_qty_;
+    return Round6(outstanding_buy_qty_ + outstanding_sell_qty_);
   }
   double total_exposure() const {
-    return total_qty() - total_cx_qty() + total_outstanding_qty();
+    return Round6(total_qty() - total_cx_qty() + total_outstanding_qty());
   }
   size_t id() const { return id_; }
 
@@ -139,28 +152,50 @@ class Instrument {
 
   void UnListen() { listen_ = false; }
   bool listen() const { return listen_; }
+  void HookTradeTick(TradeTickHook* hook) {
+    const_cast<MarketData*>(md_)->HookTradeTick(hook);
+  }
+  void UnhookTradeTick(TradeTickHook* hook) {
+    const_cast<MarketData*>(md_)->UnhookTradeTick(hook);
+  }
+  void Subscribe(Indicator::IdType id, bool listen = false);
+  void SubscribeByName(const std::string& name, bool listen = false);
+  template <typename T>
+  const T* Get() const {
+    return md_->Get<T>();
+  }
+  template <typename T = Indicator>
+  const T* Get(Indicator::IdType id) const {
+    return md_->Get<T>(id);
+  }
 
  private:
   Algo* algo_ = nullptr;
   const Security& sec_;
   const MarketData* md_ = nullptr;
   const DataSrc src_;
-  Orders active_orders_;
+  Orders active_orders_;  // cross order not inserted here
   double bought_qty_ = 0;
   double sold_qty_ = 0;
   double bought_cx_qty_ = 0;
   double sold_cx_qty_ = 0;
-  double outstanding_buy_qty_ = 0;
+  double outstanding_buy_qty_ = 0;  // cross order not impact this
   double outstanding_sell_qty_ = 0;
   size_t id_ = 0;
   bool listen_ = true;
+  uint8_t src_idx_ = -1;  // for fast looking up in price consolidation
+  Instrument* parent_ = nullptr;
   friend class AlgoManager;
   friend class Algo;
-  static inline std::atomic<size_t> kIdCounter = 0;
+  static inline std::atomic<size_t> id_counter_ = 0;
 };
 
 class AlgoRunner {
  public:
+  AlgoRunner() {}
+#ifdef UNIT_TEST
+  explicit AlgoRunner(std::thread::id tid) : tid_(tid) {}
+#endif
   void operator()();
 
  private:
@@ -192,13 +227,14 @@ class AlgoManager : public AdapterManager<Algo>, public Singleton<AlgoManager> {
   }
   void Modify(Algo* algo, Algo::ParamMapPtr params);
   void Run(int nthreads);
+  void StartPermanents();
   void Update(DataSrc::IdType src, Security::IdType id);
   void Stop();
   void Stop(Algo::IdType id);
   void Stop(const std::string& token);
   void Stop(Security::IdType sec, SubAccount::IdType acc);
   void Handle(Confirmation::Ptr cm);
-  void SetTimeout(Algo::IdType id, std::function<void()> func, double seconds);
+  void SetTimeout(const Algo& algo, std::function<void()> func, double seconds);
   bool IsSubscribed(DataSrc::IdType src, Security::IdType id) {
     return md_refs_[std::make_pair(src, id)] > 0;
   }
@@ -211,8 +247,11 @@ class AlgoManager : public AdapterManager<Algo>, public Singleton<AlgoManager> {
     return FindInMap(algo_of_token_, token);
   }
   void Cancel(Instrument* inst);
+  auto tid(const Algo& algo) const {
+    return runners_[algo.id() % threads_.size()].tid_;
+  }
 
- private:
+ protected:
   std::atomic<Algo::IdType> algo_id_counter_ = 0;
   tbb::concurrent_unordered_map<Algo::IdType, Algo*> algos_;
   tbb::concurrent_unordered_map<std::string, Algo*> algo_of_token_;
@@ -224,20 +263,25 @@ class AlgoManager : public AdapterManager<Algo>, public Singleton<AlgoManager> {
       md_refs_;
   AlgoRunner* runners_ = nullptr;
   std::vector<std::thread> threads_;
-  boost::asio::io_service io_service_;
-  std::unique_ptr<boost::asio::io_service::work> work_;
 #ifdef BACKTEST
-  struct StrandMock {
+  struct Strand {
     void post(std::function<void()> func) { kTimers.emplace(0, func); }
   };
-  std::vector<StrandMock> strands_;
 #else
-#if BOOST_VERSION < 106600
-  std::vector<boost::asio::strand> strands_;
-#else
-  std::vector<boost::asio::io_context::strand> strands_;
+  struct Strand {
+    // clang-format off
+#ifdef UNIT_TEST
+    virtual
 #endif
+    void post(std::function<void()> func) {
+      io->post(func);
+    }
+    // clang-format on
+    boost::asio::io_service* io;
+  };
+  std::vector<std::unique_ptr<boost::asio::io_service::work>> works_;
 #endif
+  Strand* strands_ = nullptr;
   std::ofstream of_;
   uint32_t seq_counter_ = 0;
   friend class AlgoRunner;

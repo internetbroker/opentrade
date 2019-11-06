@@ -8,10 +8,8 @@
 #include "opentrade/exchange_connectivity.h"
 #include "opentrade/market_data.h"
 #include "opentrade/security.h"
-#include "opentrade/task_pool.h"
 
 #include <tbb/concurrent_unordered_map.h>
-#include <tbb/concurrent_unordered_set.h>
 #include <atomic>
 #include <fstream>
 #include <string>
@@ -23,13 +21,13 @@ class IB : public opentrade::ExchangeConnectivityAdapter,
   IB();
   ~IB();
   void Start() noexcept override;
+  void Stop() noexcept override { Disconnect(); }
   void Reconnect() noexcept override;
   std::string Place(const opentrade::Order& ord) noexcept override;
   std::string Cancel(const opentrade::Order& ord) noexcept override;
   bool connected() const noexcept override {
     return 1 == connected_ && next_valid_id_ > 0 && client_->isConnected();
   }
-  void Subscribe(const opentrade::Security& sec) noexcept override;
 
  protected:
   void orderStatus(OrderId orderId, const std::string& status, double filled,
@@ -57,17 +55,15 @@ class IB : public opentrade::ExchangeConnectivityAdapter,
   void Connect(bool delay = false);
   void Read();
   void Heartbeat();
-  void Subscribe2(const opentrade::Security& sec);
+  void SubscribeSync(const opentrade::Security& sec) noexcept override;
 
   EReaderOSSignal os_signal_ = 10;  // 10 ms timeout for reader
   EClientSocket* const client_ = nullptr;
   std::shared_ptr<EReader> reader_;
-  TickerId ticker_id_counter_ = 0;
 
   std::string host_;
   int port_ = 0;
   std::ofstream of_;
-  opentrade::TaskPool tp_;
   opentrade::TaskPool io_tp_;
   int heartbeat_interval_ = 5;
   time_t last_heartbeat_tm_ = 0;
@@ -76,7 +72,6 @@ class IB : public opentrade::ExchangeConnectivityAdapter,
   tbb::concurrent_unordered_map<uint32_t, uint32_t> orders_;
   tbb::concurrent_unordered_map<uint32_t, uint32_t> orders2_;
   tbb::concurrent_unordered_map<TickerId, const opentrade::Security*> tickers_;
-  tbb::concurrent_unordered_set<const opentrade::Security*> subs_;
 };
 
 #endif  // ADAPTERS_IB_IB_H_

@@ -27,7 +27,7 @@ static std::unordered_map<WsConnPtr, Connection::Ptr> kSocketMap;
 static std::mutex kMutex;
 static auto kIoService = std::make_shared<boost::asio::io_service>();
 
-void close(WsConnPtr connection) {
+void Close(WsConnPtr connection) {
   LockGuard lock(kMutex);
   auto it = kSocketMap.find(connection);
   if (it == kSocketMap.end()) return;
@@ -83,14 +83,35 @@ void Server::Publish(Confirmation::Ptr cm) {
   });
 }
 
-void Server::Publish(const SubAccount& acc, const std::string& msg) {
+void Server::Publish(const std::string& msg, const SubAccount* acc) {
 #ifdef BACKTEST
   return;
 #endif
-  kIoService->post([&acc, msg]() {
+  kIoService->post([msg, acc]() {
     LockGuard lock(kMutex);
     for (auto& pair : kSocketMap) {
-      pair.second->Send(acc, msg);
+      pair.second->Send(msg, acc);
+    }
+  });
+}
+
+void Server::CloseConnection(User::IdType id) {
+  kIoService->post([id]() {
+    LockGuard lock(kMutex);
+    for (auto& pair : kSocketMap) {
+      auto user = pair.second->user();
+      if (!id || (user && user->id == id)) {
+        pair.first->send_close(1011);
+      }
+    }
+  });
+}
+
+void Server::Trigger(const std::string& cmd) {
+  kIoService->post([cmd]() {
+    LockGuard lock(kMutex);
+    for (auto& pair : kSocketMap) {
+      pair.second->OnMessageAsync(cmd);
     }
   });
 }
@@ -205,8 +226,6 @@ void Server::Start(int port, int nthreads) {
   };
 
   endpoint.on_open = [](WsConnPtr connection) {
-    LOG_DEBUG("Websocket Server: Opened connection "
-              << connection->remote_endpoint_address());
     auto p = std::make_shared<Connection>(
         std::make_shared<WsSocketWrapper>(connection), kIoService);
     {
@@ -217,17 +236,14 @@ void Server::Start(int port, int nthreads) {
 
   endpoint.on_close = [](WsConnPtr connection, int status,
                          const std::string& /*reason*/) {
-    LOG_DEBUG("Websocket Server: Closed connection "
-              << connection->remote_endpoint_address() << " with status code "
-              << status);
-    close(connection);
+    LOG_DEBUG("endpoint.on_close"
+              << " status code " << status);
+    Close(connection);
   };
 
   endpoint.on_error = [](WsConnPtr connection, const SimpleWeb::error_code& e) {
-    LOG_DEBUG("Websocket Server: Error in connection "
-              << connection->remote_endpoint_address() << ". "
-              << "Error: " << e << ", error message: " << e.message());
-    close(connection);
+    LOG_DEBUG("endpoint.on_error message: " << e.message());
+    Close(connection);
   };
 
   // to make nginx work
@@ -243,14 +259,13 @@ void Server::Start(int port, int nthreads) {
     connection->query_string = std::move(request->query_string);
     connection->http_version = std::move(request->http_version);
     connection->header = std::move(request->header);
-    connection->remote_endpoint = std::move(*request->remote_endpoint);
     kWsServer.upgrade(connection);
   };
 
   ServeStatic();
 
-  kHttpServer.resource["^/api$"]["POST"] = [](ResponsePtr response,
-                                              RequestPtr request) {
+  kHttpServer.resource["^/api[/]$"]["POST"] = [](ResponsePtr response,
+                                                 RequestPtr request) {
     auto sessionToken = FindInMap(request->header, "session-token");
     std::make_shared<Connection>(
         std::make_shared<HttpWrapper>(response, request), kIoService)
@@ -265,12 +280,17 @@ void Server::Start(int port, int nthreads) {
   try {
     kWsServer.start();
     kHttpServer.start();
-    LOG_INFO("http://0.0.0.0:" << port << " starts to listen");
-    LOG_INFO("ws://0.0.0.0:" << port << "/ot"
-                             << " starts to listen");
+    LOG_INFO("http://0.0.0.0:" << port);
+    LOG_INFO("ws://0.0.0.0:" << port << "/ot/");
+    LOG_INFO("http://0.0.0.0:" << port << "/api/");
     std::vector<std::thread> threads;
     for (auto i = 0; i < nthreads; ++i) {
       threads.emplace_back([]() { kIoService->run(); });
+    }
+    if (fs::exists(fs::path("start.py"))) {
+      if (system(("nohup ./start.py " + std::to_string(port) + " &").c_str())) {
+        // bypass compile warn
+      }
     }
     for (auto& t : threads) t.join();
   } catch (std::runtime_error& e) {

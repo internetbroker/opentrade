@@ -23,11 +23,15 @@ struct CrossSecurity {
   std::mutex m;
   typedef std::lock_guard<std::mutex> Lock;
   void Execute(CrossOrder* ord);
+  void Erase(const CrossOrder& ord);
+  void Erase(Algo::IdType aid);
 };
 
 class CrossEngine : public Singleton<CrossEngine> {
  public:
   void Place(CrossOrder* ord);
+  void Erase(const CrossOrder& ord) { Get(ord.sec->id)->Erase(ord); }
+  void Erase(Security::IdType sid, Algo::IdType aid) { Get(sid)->Erase(aid); }
   void UpdateTrade(Confirmation::Ptr cm);
 
  private:
@@ -42,6 +46,7 @@ class CrossEngine : public Singleton<CrossEngine> {
   std::unordered_map<Security::IdType, CrossSecurity*> securities_;
   std::mutex m_;
   typedef std::lock_guard<std::mutex> Lock;
+  friend class Backtest;
 };
 
 }  // namespace opentrade

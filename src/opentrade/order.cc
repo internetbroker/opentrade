@@ -10,6 +10,7 @@
 
 #include "algo.h"
 #include "connection.h"
+#include "database.h"
 #include "exchange_connectivity.h"
 #include "logger.h"
 #include "position.h"
@@ -46,9 +47,16 @@ void GlobalOrderBook::Initialize() {
 inline void GlobalOrderBook::UpdateOrder(Confirmation::Ptr cm) {
   switch (cm->exec_type) {
     case kUnconfirmedNew:
-    case kUnconfirmedCancel:
-      orders_.emplace(cm->order->id, cm->order);
-      break;
+    case kUnconfirmedCancel: {
+      auto ord = cm->order;
+      if (cm->exec_type == kUnconfirmedNew) ord->leaves_qty = ord->qty;
+      if (!ord->id) {  // if offline, id and tm already assigned
+        ord->id = NewOrderId();
+        ord->tm = NowUtcInMicro();
+      }
+      orders_.emplace(ord->id, ord);
+      ord->status = cm->exec_type;
+    } break;
     case kPartiallyFilled:
     case kFilled:
       if (cm->exec_trans_type == kTransNew) {
@@ -58,6 +66,8 @@ inline void GlobalOrderBook::UpdateOrder(Confirmation::Ptr cm) {
             (ord->cum_qty + cm->last_shares);
         ord->cum_qty += cm->last_shares;
         ord->leaves_qty -= cm->last_shares;
+        ord->cum_qty = Round6(ord->cum_qty);
+        ord->leaves_qty = Round6(ord->leaves_qty);
         if (ord->cum_qty >= ord->qty)
           ord->status = kFilled;
         else if (ord->IsLive())
@@ -72,6 +82,7 @@ inline void GlobalOrderBook::UpdateOrder(Confirmation::Ptr cm) {
               (ord->avg_px * ord->cum_qty - cm->last_px * cm->last_shares) /
               (ord->cum_qty - cm->last_shares);
           ord->cum_qty -= cm->last_shares;
+          ord->cum_qty = Round6(ord->cum_qty);
         }
       } else {
         // to-do
@@ -99,7 +110,9 @@ inline void GlobalOrderBook::UpdateOrder(Confirmation::Ptr cm) {
 }
 
 void GlobalOrderBook::Handle(Confirmation::Ptr cm, bool offline) {
-  if (cm->order->id <= 0) {  // risk rejected, not persist
+  // risk rejected not by adapter, not persist
+  if (cm->exec_type == kRiskRejected &&
+      cm->order->status == kOrderStatusUnknown) {
     assert(!offline);
     Server::Publish(cm);
     if (cm->order->inst) AlgoManager::Instance().Handle(cm);
@@ -145,6 +158,7 @@ void GlobalOrderBook::Handle(Confirmation::Ptr cm, bool offline) {
            << static_cast<char>(ord->type) << ' ' << static_cast<char>(ord->tif)
            << ' ' << ord->sec->id << ' ' << ord->user->id << ' '
            << ord->broker_account->id;
+        if (!ord->destination.empty()) ss << ' ' << ord->destination;
       } break;
       case kUnconfirmedCancel:
         ss << ord->id << ' ' << cm->transaction_time << ' ' << ord->orig_id;
@@ -157,13 +171,13 @@ void GlobalOrderBook::Handle(Confirmation::Ptr cm, bool offline) {
     }
     auto str = ss.str();
     if (str.empty()) return;
-    // excluding length and seq and exec_type and ending '\0\n'
     of_.write(reinterpret_cast<const char*>(&cm->seq), sizeof(cm->seq));
     uint16_t n = str.size();
     of_.write(reinterpret_cast<const char*>(&n), sizeof(n));
+    of_ << static_cast<char>(cm->exec_type);
     of_.write(reinterpret_cast<const char*>(&ord->sub_account->id),
               sizeof(ord->sub_account->id));
-    of_ << static_cast<char>(cm->exec_type);
+    if (str.size() > n) str = str.substr(0, n);
     of_ << str << '\0' << std::endl;
   });
 }
@@ -174,25 +188,31 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
   auto p = m.data();
   auto p_end = p + m.size();
   auto ln = 0;
+  std::unordered_set<Order::IdType> orders_to_ignore;
   while (p + 6 < p_end) {
     ln++;
     auto seq = *reinterpret_cast<const uint32_t*>(p);
     if (!conn) seq_counter_ = seq;
     p += 4;
     auto n = *reinterpret_cast<const uint16_t*>(p);
-    if (p + n + 5 + sizeof(SubAccount::IdType) > p_end) break;
+    if (p + 2 + 1 + sizeof(SubAccount::IdType) + n > p_end) break;
+    if (seq <= seq0) {
+      p += 2 + 1 + sizeof(SubAccount::IdType) + n + 2;
+      continue;
+    }
     p += 2;
-    auto sub_account_id = *reinterpret_cast<const SubAccount::IdType*>(p);
-    p += sizeof(SubAccount::IdType);
     auto exec_type = static_cast<opentrade::OrderStatus>(*p);
     p += 1;
+    auto sub_account_id = *reinterpret_cast<const SubAccount::IdType*>(p);
+    p += sizeof(SubAccount::IdType);
     auto body = p;
     p += n + 2;  // body + '\0' + '\n'
-    if (seq <= seq0) continue;
     if (conn) {
       assert(conn->user_);
       if (!conn->user_->is_admin && !conn->user_->GetSubAccount(sub_account_id))
         continue;
+      auto id = atol(body);
+      if (orders_to_ignore.find(id) != orders_to_ignore.end()) continue;
     }
     switch (exec_type) {
       case kNew:
@@ -201,7 +221,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         int64_t tm;
         char id_str[n];
         *id_str = 0;
-        if (sscanf(body, "%u %ld %[^\1]s", &id, &tm, id_str) < 2) {
+        if (sscanf(body, "%u %ld %[^\1]", &id, &tm, id_str) < 2) {
           LOG_ERROR("Failed to parse confirmation line #" << ln);
           continue;
         }
@@ -221,6 +241,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         if (!ord) {
           LOG_ERROR("Unknown order id " << id << " on confirmation line #"
                                         << ln);
+          continue;
         }
         auto cm = std::make_shared<Confirmation>();
         cm->exec_type = exec_type;
@@ -237,7 +258,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         double last_px;
         char exec_trans_type;
         char exec_id[n];
-        if (sscanf(body, "%u %ld %lf %lf %c %[^\1]s", &id, &tm, &last_shares,
+        if (sscanf(body, "%u %ld %lf %lf %c %[^\1]", &id, &tm, &last_shares,
                    &last_px, &exec_trans_type, exec_id) < 6) {
           LOG_ERROR("Failed to parse confirmation line #" << ln);
           continue;
@@ -294,7 +315,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         int64_t tm;
         char text[n];
         *text = 0;
-        if (sscanf(body, "%u %ld %[^\1]s", &id, &tm, text) < 2) {
+        if (sscanf(body, "%u %ld %[^\1]", &id, &tm, text) < 2) {
           LOG_ERROR("Failed to parse confirmation line #" << ln);
           continue;
         }
@@ -336,37 +357,25 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         uint32_t sec_id;
         uint32_t user_id;
         uint32_t broker_account_id;
-        if (sscanf(body, "%u %ld %u %lf %lf %lf %c %c %c %u %u %u", &id, &tm,
+        char destination[n];
+        *destination = 0;
+        if (sscanf(body, "%u %ld %u %lf %lf %lf %c %c %c %u %u %u %s", &id, &tm,
                    &algo_id, &qty, &price, &stop_price, &side, &type, &tif,
-                   &sec_id, &user_id, &broker_account_id) < 12) {
+                   &sec_id, &user_id, &broker_account_id, destination) < 12) {
           LOG_ERROR("Failed to parse confirmation line #" << ln);
           continue;
         }
         if (conn) {
+          auto ord = Get(id);
+          assert(ord);
+          if (!ord) continue;
+          if (ord->status == kCanceled && ord->cum_qty == 0) {
+            orders_to_ignore.insert(id);
+            continue;
+          }
           Confirmation cm{};
           cm.seq = seq;
-          Order ord{};
-          ord.id = id;
-          ord.algo_id = algo_id;
-          ord.qty = qty;
-          ord.price = price;
-          ord.stop_price = stop_price;
-          ord.side = static_cast<opentrade::OrderSide>(side);
-          ord.type = static_cast<opentrade::OrderType>(type);
-          ord.tif = static_cast<opentrade::TimeInForce>(tif);
-          Security sec{};
-          sec.id = sec_id;
-          ord.sec = &sec;
-          User user;
-          user.id = user_id;
-          ord.user = &user;
-          SubAccount sub_account;
-          sub_account.id = sub_account_id;
-          ord.sub_account = &sub_account;
-          BrokerAccount broker_account;
-          broker_account.id = broker_account_id;
-          ord.broker_account = &broker_account;
-          cm.order = &ord;
+          cm.order = ord;
           cm.exec_type = exec_type;
           cm.transaction_time = tm;
           conn->Send(cm, true);
@@ -402,7 +411,6 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         ord->id = id;
         ord->algo_id = algo_id;
         ord->qty = qty;
-        ord->leaves_qty = qty;
         ord->price = price;
         ord->stop_price = stop_price;
         ord->side = static_cast<opentrade::OrderSide>(side);
@@ -412,6 +420,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         ord->user = user;
         ord->sub_account = sub_account;
         ord->broker_account = broker_account;
+        ord->destination = destination;
         ord->tm = tm;
         auto cm = std::make_shared<Confirmation>();
         cm->exec_type = exec_type;
@@ -438,7 +447,6 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         auto cancel_order = new Order(*orig_ord);
         cancel_order->id = id;
         cancel_order->orig_id = orig_id;
-        cancel_order->status = kUnconfirmedCancel;
         cancel_order->tm = tm;
         auto cm = std::make_shared<Confirmation>();
         cm->exec_type = exec_type;
@@ -451,7 +459,7 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         uint32_t id;
         char text[n];
         *text = 0;
-        if (sscanf(body, "%u %[^\1]s", &id, text) < 1) {
+        if (sscanf(body, "%u %[^\1]", &id, text) < 1) {
           LOG_ERROR("Failed to parse confirmation line #" << ln);
           continue;
         }
@@ -477,6 +485,18 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
         cm->text = text;
         Handle(cm, true);
       } break;
+      case kComment:
+        if (!conn) {
+          uint32_t id;
+          char exec_id[n];
+          *exec_id = 0;
+          if (sscanf(body, "exec_id %u %s", &id, exec_id) != 2) {
+            LOG_ERROR("Failed to parse confirmation line #" << ln);
+            continue;
+          }
+          exec_ids_.emplace(id, std::string(exec_id));
+        }
+        break;
       default:
         break;
     }
@@ -485,6 +505,9 @@ void GlobalOrderBook::LoadStore(uint32_t seq0, Connection* conn) {
     LOG_FATAL("Corrupted confirmation file: " << kPath.c_str()
                                               << ", please fix it first");
   }
+  if (conn) {
+    LOG_DEBUG("Load offline confirmation done");
+  }
 }
 
 void GlobalOrderBook::Cancel() {
@@ -492,6 +515,31 @@ void GlobalOrderBook::Cancel() {
     auto ord = pair.second;
     if (ord->IsLive()) ExchangeConnectivityManager::Instance().Cancel(*ord);
   }
+}
+
+// to avoid duplicate execution due to message resent or some other unknown
+// circumstances
+void GlobalOrderBook::ReadPreviousDayExecIds() {
+  auto sql = Database::Session();
+  LOG_INFO("ReadPreviousDayExecIds");
+  std::string tm = GetNowStr<false, -24 * 3600>();
+  soci::rowset<soci::row> st =
+      (sql->prepare << "select info from position where tm>:tm", soci::use(tm));
+  for (auto it = st.begin(); it != st.end(); ++it) {
+    std::string info;
+    info = Database::GetValue(*it, 0, info);
+    if (!info.empty()) {
+      try {
+        auto j = json::parse(info);
+        auto id = j["id"].get<int64_t>();
+        auto exec_id = j["exec_id"].get<std::string>();
+        IsDupExecId(id, exec_id);
+      } catch (std::exception& e) {
+        LOG_ERROR(e.what());
+      }
+    }
+  }
+  LOG_INFO(exec_ids_.size() << " exec ids loaded");
 }
 
 }  // namespace opentrade

@@ -3,68 +3,45 @@
 #ifdef BACKTEST
 
 #include <boost/date_time/gregorian/gregorian.hpp>
+#include <cstdlib>
 #include <fstream>
-#include <unordered_map>
+#include <set>
 
-#include "exchange_connectivity.h"
-#include "market_data.h"
-#include "order.h"
 #include "python.h"
 #include "security.h"
 
 namespace opentrade {
 
-class Backtest : public ExchangeConnectivityAdapter,
-                 public MarketDataAdapter,
-                 public Singleton<Backtest> {
+class Simulator;
+
+class Backtest : public Singleton<Backtest> {
  public:
-  Backtest() : of_("trades.txt") { connected_ = 1; }
-  void Start() noexcept override {}
-  void Reconnect() noexcept override {}
-  void Subscribe(const opentrade::Security& sec) noexcept override {}
-  std::string Place(const opentrade::Order& ord) noexcept override;
-  std::string Cancel(const opentrade::Order& ord) noexcept override;
-  void PlayTickFile(const std::string& fn_tmpl,
-                    const boost::gregorian::date& date);
-  void Start(const std::string& py, double latency);
-  SubAccount* CreateSubAccount(const std::string& name);
+  Backtest() : of_(PythonOr(std::getenv("TRADES_OUTFILE"), "trades.txt")) {}
+  void Play(const boost::gregorian::date& date);
+  void Start(const std::string& py, const std::string& default_tick_file);
+  SubAccount* CreateSubAccount(const std::string& name,
+                               const BrokerAccount* broker = nullptr);
   void End();
   void Clear();
   void Skip() { skip_ = true; }
-
- private:
-  struct OrderTuple {
-    double leaves = 0;
-    const Order* order = nullptr;
-  };
-  struct Orders {
-    typedef std::multimap<double, OrderTuple> Map;
-    Map buys;
-    Map sells;
-    std::unordered_map<Order::IdType, Map::iterator> all;
-  };
-  typedef std::tuple<const Security*, double, double, Orders*> SecTuple;
-  void HandleTick(uint32_t hmsm, char type, double px, double qty,
-                  const SecTuple& st);
-  double TryFillBuy(double px, double qty, Orders* m);
-  double TryFillSell(double px, double qty, Orders* m);
+  void AddSimulator(const std::string& fn_tmpl, const std::string& name = "");
+  auto latency() { return latency_; }
 
  private:
   bp::object obj_;
-  std::unordered_map<Security::IdType, Orders> active_orders_;
   bp::object on_start_;
   bp::object on_start_of_day_;
   bp::object on_end_of_day_;
   bp::object on_end_;
   double latency_ = 0;  // in seconds
-  time_t tm0_ = 0;
-  uint32_t seed_ = 0;
-  double trade_hit_ratio_ = 0;
+  double trade_hit_ratio_ = 0.5;
   std::ofstream of_;
   bool skip_;
+  std::vector<std::pair<std::string, Simulator*>> simulators_;
+  std::set<std::string> used_symbols_;
 };
 
 }  // namespace opentrade
 
-#endif
+#endif  // BACKTEST
 #endif  // OPENTRADE_BACKTEST_H_

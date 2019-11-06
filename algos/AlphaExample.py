@@ -10,6 +10,7 @@ def get_param_defs():
 def on_start(self, params):
   self.st = st = params['Security']
   self.inst = self.subscribe(st.sec, st.src)
+  # self.inst.subscribe('bar', True)
   self.vwap15 = [[0, 0], [], 15]
   self.vwap30 = [[0, 0], [], 30]
   self.set_timeout(lambda: self.stop(),
@@ -19,6 +20,9 @@ def on_start(self, params):
       st.sec.exchange.trade_end - st.sec.exchange.seconds - 60)
   self.end = False
 
+
+def on_indicator(self, ind, inst):
+  log_debug(str(ind['last']))
 
 def close_pos(self):
   self.end = True

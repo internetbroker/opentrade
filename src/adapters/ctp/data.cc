@@ -1,10 +1,9 @@
-﻿#include <unordered_set>
 #include <tbb/concurrent_unordered_map.h>
+#include <unordered_set>
 
 #include "api/ThostFtdcMdApi.h"
 #include "opentrade/logger.h"
 #include "opentrade/market_data.h"
-#include "opentrade/task_pool.h"
 
 using Security = opentrade::Security;
 
@@ -12,11 +11,12 @@ class Data : public CThostFtdcMdSpi, public opentrade::MarketDataAdapter {
  public:
   ~Data();
   void Start() noexcept override;
-  void Subscribe(const Security &sec) noexcept override;
+  void Stop() noexcept override;
   void Reconnect() noexcept override;
 
  private:
-  void Subscribe2(const Security &sec);
+  void SubscribeSync(const Security &sec) noexcept override;
+  void Close();
   void OnFrontConnected() override;
   void OnFrontDisconnected(int reason) override;
   void OnRspUserLogin(CThostFtdcRspUserLoginField *rsp_user_login,
@@ -38,15 +38,12 @@ class Data : public CThostFtdcMdSpi, public opentrade::MarketDataAdapter {
                              CThostFtdcRspInfoField *rsp_info, int request_id,
                              bool is_last) override;
   void OnRtnForQuoteRsp(CThostFtdcForQuoteRspField *data) override;
-
   void OnHeartBeatWarning(int time_lapse) override;
 
  private:
   CThostFtdcMdApi *api_ = nullptr;
   std::string address_, broker_id_, user_id_, password_;
-  std::unordered_set<const Security *> subs_;
   tbb::concurrent_unordered_map<std::string, const Security *> instruments_;
-  opentrade::TaskPool tp_;
 };
 
 Data::~Data() { api_->Release(); }
@@ -75,22 +72,22 @@ void Data::Start() noexcept {
   Reconnect();
 }
 
-void Data::Subscribe(const Security &sec) noexcept {
-  tp_.AddTask([this, &sec]() {
-    if (!subs_.insert(&sec).second) return;
-    if (!connected()) return;
-    Subscribe2(sec);
-  });
+void Data::Close() {
+  connected_ = 0;
+  if (api_) {
+    api_->Join();
+    api_->RegisterSpi(NULL);
+    api_->Release();
+  }
+}
+
+void Data::Stop() noexcept {
+  tp_.AddTask([this]() { Close(); });
 }
 
 void Data::Reconnect() noexcept {
   tp_.AddTask([this]() {
-    connected_ = 0;
-    if (api_) {
-      api_->Join();
-      api_->RegisterSpi(NULL);
-      api_->Release();
-    }
+    Close();
     api_ = CThostFtdcMdApi::CreateFtdcMdApi();
     api_->RegisterSpi(this);
     LOG_INFO(name() << ": Connecting to " << address_);
@@ -99,7 +96,7 @@ void Data::Reconnect() noexcept {
   });
 }
 
-void Data::Subscribe2(const Security &sec) {
+void Data::SubscribeSync(const Security &sec) noexcept {
   char *req[1] = {const_cast<char *>(sec.local_symbol)};
   instruments_[sec.local_symbol] = &sec;
   api_->SubscribeMarketData(req, 1);
@@ -200,13 +197,13 @@ void Data::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *data) {
 void Data::OnRtnForQuoteRsp(CThostFtdcForQuoteRspField *data) {}
 
 void Data::OnFrontConnected() {
-  CThostFtdcReqUserLoginField login;
-  strncpy(login.BrokerID, broker_id_.c_str(), sizeof(login.BrokerID));
-  strncpy(login.UserID, user_id_.c_str(), sizeof(login.UserID));
-  strncpy(login.Password, password_.c_str(), sizeof(login.Password));
+  CThostFtdcReqUserLoginField login{};
+  strncpy(login.BrokerID, broker_id_.c_str(), sizeof(login.BrokerID) - 1);
+  strncpy(login.UserID, user_id_.c_str(), sizeof(login.UserID) - 1);
+  strncpy(login.Password, password_.c_str(), sizeof(login.Password) - 1);
   // 发出登陆请求
   LOG_INFO(name() << ": Connected, send login");
-  api_->ReqUserLogin(&login, 0);
+  api_->ReqUserLogin(&login, ++request_counter_);
 }
 
 // 当客户端与交易托管系统通信连接断开时，该方法被调用
@@ -228,8 +225,8 @@ void Data::OnRspUserLogin(CThostFtdcRspUserLoginField *rsp_user_login,
     return;
   }
   tp_.AddTask([this]() {
-    for (auto sec : subs_) Subscribe2(*sec);
     connected_ = 1;
+    ReSubscribeAll();
   });
   LOG_INFO(name() << ": User logged in");
 }

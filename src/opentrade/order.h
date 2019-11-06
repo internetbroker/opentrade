@@ -6,8 +6,8 @@
 #include <any>
 #include <atomic>
 #include <fstream>
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 
@@ -32,6 +32,7 @@ enum OrderType : char {
 };
 
 enum OrderStatus : char {
+  kOrderStatusUnknown = 0,
   kNew = '0',
   kPartiallyFilled = '1',
   kFilled = '2',
@@ -52,6 +53,7 @@ enum OrderStatus : char {
   kUnconfirmedCancel = 'c',
   kUnconfirmedReplace = 'd',
   kCancelRejected = 'e',
+  kComment = '#',
 };
 
 enum TimeInForce : char {
@@ -72,8 +74,12 @@ enum ExecTransType : char {
 };
 
 static inline bool IsBuy(OrderSide side) { return side == kBuy; }
+static inline bool IsShort(OrderSide side) { return side == kShort; }
 
 struct Contract {
+#ifdef TEST_LATENCY
+  time_t tm_for_test_latency = 0;
+#endif
   double qty = 0;
   double price = 0;
   double stop_price = 0;
@@ -82,20 +88,27 @@ struct Contract {
     const SubAccount* sub_account = nullptr;
     const SubAccount* acc;  // alias of sub_account
   };
-  std::map<std::string,
-           std::variant<bool, int64_t, double, std::string, std::any>>*
+  // Usually you do not need to set destination,
+  // We can find destination automatically from broker_account via predefined
+  // sub_account_broker_account_map table. But for smart route or FX aggregator,
+  // one primary exchange have many venues (ECN or LP), you need to set
+  // destination manually.
+  std::string destination;
+  std::unordered_map<std::string, std::variant<bool, int64_t, double, char,
+                                               std::string, std::any>>*
       optional = nullptr;
   OrderSide side = kBuy;
   OrderType type = kLimit;
   TimeInForce tif = kDay;
 
   bool IsBuy() const { return opentrade::IsBuy(side); }
+  bool IsShort() const { return opentrade::IsShort(side); }
 };
 
 class Instrument;
 
 struct Order : public Contract {
-  OrderStatus status = kUnconfirmedNew;
+  OrderStatus status = kOrderStatusUnknown;
 
   // in case inst of offline order is nullptr, for frontend only
   uint32_t algo_id = 0;
@@ -108,7 +121,7 @@ struct Order : public Contract {
   double leaves_qty = 0;
   int64_t tm = 0;
   const User* user = nullptr;
-  const BrokerAccount* broker_account = nullptr;
+  const BrokerAccount* broker_account = nullptr;  // primary broker account
   const Instrument* inst = nullptr;
 
   bool IsLive() const {
@@ -123,7 +136,7 @@ struct Confirmation {
   std::string exec_id;
   std::string order_id;
   std::string text;
-  OrderStatus exec_type = kUnconfirmedNew;
+  OrderStatus exec_type = kOrderStatusUnknown;
   ExecTransType exec_trans_type = kTransNew;
   union {
     double last_shares = 0;
@@ -132,7 +145,7 @@ struct Confirmation {
   double last_px = 0;
   int64_t transaction_time = 0;  // utc in microseconds
   uint32_t seq = 0;
-  typedef std::map<std::string, std::string> StrMap;
+  typedef std::unordered_map<std::string, std::string> StrMap;
   typedef std::shared_ptr<StrMap> StrMapPtr;
   StrMapPtr misc;
 };
@@ -153,6 +166,14 @@ class GlobalOrderBook : public Singleton<GlobalOrderBook> {
   void Cancel();
   void Handle(Confirmation::Ptr cm, bool offline = false);
   void LoadStore(uint32_t seq0 = 0, Connection* conn = nullptr);
+  void ReadPreviousDayExecIds();
+  auto GetOrders(OrderStatus status) {
+    std::vector<Order*> out;
+    for (auto& pair : orders_) {
+      if (pair.second->status == status) out.push_back(pair.second);
+    }
+    return out;
+  }
 
  private:
   void UpdateOrder(Confirmation::Ptr cm);

@@ -55,6 +55,12 @@ class AsyncFileLog : public FileLog {
   opentrade::TaskPool pool_;
 };
 
+struct NullLogFactory : public LogFactory {
+  Log* create() override { return new NullLog; }
+  Log* create(const SessionID&) override { return create(); }
+  void destroy(Log* log) override { delete log; };
+};
+
 class AsyncFileLogFactory : public FileLogFactory {
  public:
   explicit AsyncFileLogFactory(const SessionSettings& settings)

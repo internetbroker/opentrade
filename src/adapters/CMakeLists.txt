@@ -1,4 +1,4 @@
-add_subdirectory(bpipe)
-add_subdirectory(ib)
-add_subdirectory(ctp)
-add_subdirectory(fix42)
+subdirlist(SUBDIRS)
+foreach(SUBDIR ${SUBDIRS})
+  add_subdirectory(${SUBDIR})
+endforeach()

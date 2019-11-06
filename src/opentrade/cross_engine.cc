@@ -23,18 +23,22 @@ void CrossSecurity::Execute(CrossOrder* ord) {
   if (!(buys.size() && sells.size())) return;
   if (!price) return;
   auto& ecm = ExchangeConnectivityManager::Instance();
-  while (buys.size() && sells.size()) {
-    auto buy = buys.front();
+  for (auto it_buy = buys.begin(); it_buy != buys.end() && sells.size();) {
+    auto buy = *it_buy;
     if (!buy->inst->algo().is_active()) {
-      buys.pop_front();
+      it_buy = buys.erase(it_buy);
       continue;
     }
     auto a = buy->leaves();
     assert(a > 0);
-    while (sells.size() && a > 0) {
-      auto sell = sells.front();
+    for (auto it_sell = sells.begin(); it_sell != sells.end() && a > 0;) {
+      auto sell = *it_sell;
       if (!sell->inst->algo().is_active()) {
-        sells.pop_front();
+        it_sell = sells.erase(it_sell);
+        continue;
+      }
+      if (buy->inst->algo().id() == sell->inst->algo().id()) {
+        ++it_sell;
         continue;
       }
       auto b = sell->leaves();
@@ -53,8 +57,10 @@ void CrossSecurity::Execute(CrossOrder* ord) {
                        "CX-" + std::to_string(sell->id) + "-" +
                            std::to_string(sell->count++));
       if (!b) {
-        sells.pop_front();
+        it_sell = sells.erase(it_sell);
+        continue;
       }
+      ++it_sell;
     }
     auto qty = buy->leaves() - a;
     if (qty > 0) {
@@ -64,8 +70,10 @@ void CrossSecurity::Execute(CrossOrder* ord) {
           "CX-" + std::to_string(buy->id) + "-" + std::to_string(buy->count++));
     }
     if (!a) {
-      buys.pop_front();
+      it_buy = buys.erase(it_buy);
+      continue;
     }
+    ++it_buy;
   }
 }
 
@@ -81,6 +89,26 @@ void CrossEngine::UpdateTrade(Confirmation::Ptr cm) {
         orders.erase(it);
       }
       break;
+    }
+  }
+}
+
+void CrossSecurity::Erase(const CrossOrder& ord) {
+  Lock lock(m);
+  auto& ords = (ord.IsBuy() ? buys : sells);
+  auto it = std::find(ords.begin(), ords.end(), &ord);
+  if (it != ords.end()) ords.erase(it);
+}
+
+void CrossSecurity::Erase(Algo::IdType aid) {
+  Lock lock(m);
+  for (auto i = 0; i < 2; ++i) {
+    auto& ords = i ? buys : sells;
+    for (auto it = ords.begin(); it != ords.end();) {
+      if ((*it)->inst->algo().id() == aid)
+        it = ords.erase(it);
+      else
+        ++it;
     }
   }
 }

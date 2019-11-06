@@ -1,7 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import optparse
 import pg8000
+import sqlite3
+import pandas as pd
 
 types = ('STK', 'CASH', 'CMDTY', 'FUT', 'OPT', 'IND', 'FOP', 'WAR', 'BOND',
          'FUND')
@@ -9,84 +11,82 @@ types = ('STK', 'CASH', 'CMDTY', 'FUT', 'OPT', 'IND', 'FOP', 'WAR', 'BOND',
 
 def main():
   opts = optparse.OptionParser()
-  opts.add_option('-e', '--exchange', help='exchange name')
-  opts.add_option('-t', '--sec_type', help='sec type: ' + ', '.join(types))
+  opts.add_option(
+      '-d',
+      '--db_url',
+      help='sqlite3 file path or postgres url "host,database,user,password"')
   opts.add_option('-f', '--file', help='security symbol list file')
+  opts.add_option('', '--dry_run', action='store_true')
   opts = opts.parse_args()[0]
 
-  if not opts.exchange:
-    print("Error: --exchange not give")
+  if not opts.db_url and not opts.dry_run:
+    print('Error: --db_url not give')
     return
 
   if not opts.file:
-    print("Error: --file not give")
+    print('Error: --file not give')
     return
 
-  if not opts.sec_type:
-    print("Error: --sec_type not give")
-    return
-
-  if opts.sec_type not in types:
-    print("Error: invalid sec_type")
-    return
-
-  conn = pg8000.connect(
-      host='127.0.0.1', database='opentrade', user='postgres', password='test')
+  is_sqlite = False
+  if opts.db_url.endswith('sqlite3'):
+    is_sqlite = True
+    conn = sqlite3.connect(opts.db_url)
+  else:
+    host, database, user, password = opts.db_url.split(',')
+    conn = pg8000.connect(host=host,
+                          database=database,
+                          user=user,
+                          password=password)
 
   cursor = conn.cursor()
   exchanges = {}
   cursor.execute('select name, id from exchange')
   for m in cursor.fetchall():
     exchanges[m[0]] = m[1]
-  exchange_id = exchanges.get(opts.exchange)
-  if exchange_id is None:
-    print('unknown exchange: ' + opts.exchange)
-    return
-  cursor.execute('select bbgid from security')
-  bbgids = set([r[0] for r in cursor.fetchall()])
+  cursor.execute('select id, bbgid, exchange_id, symbol from security')
+  # bbgids = {} # use to identify security if symbol change
+  symbols = {}
+  for r in cursor.fetchall():
+    # bbgids[r[1]] = r[0]
+    symbols[str(r[2]) + ' ' + r[3]] = r[0]
 
-  with open(opts.file) as fh:
-    fh.readline()
-    for line in fh:
-      toks = line.strip().split(',')
-      fields = [
-          'symbol', 'local_symbol', '', 'currency', 'bbgid', 'sedol', 'isin',
-          'cusip', 'close_price', 'adv20', 'market_cap', 'sector',
-          'industry_group', 'industry', 'sub_industry', '', 'lot_size',
-          'multiplier', ''
-      ]
-      values = []
-      valid_fields = []
-      bbgid = None
-      for i in range(0, len(fields)):
-        f = fields[i]
-        if not f: continue
-        valid_fields.append(fields[i])
-        values.append(toks[i])
-        v = values[-1]
-        if not v:
-          values[-1] = None
-          continue
-        if f == 'bbgid': bbgid = v
-        if f in ('close_price', 'adv20', 'market_cap', 'lot_size',
-                 'multiplier'):
-          values[-1] = float(v)
-        if f in ('sector', 'industry_group', 'industry', 'sub_industry'):
-          values[-1] = int(v)
-      values[0] = values[0].split()[0]
-      if bbgid not in bbgids:
-        valid_fields.append('"type"')
-        values.append(opts.sec_type)
-        valid_fields.append('exchange_id')
-        values.append(exchange_id)
-        cursor.execute(
-            'insert into security (' + ', '.join(valid_fields) + ') values(' +
-            ', '.join(['%s'] * len(valid_fields)) + ')', values)
-      else:
-        cursor.execute('update security set ' + ', '.join(
-            [f + '=%s' for f in valid_fields]) + ' where bbgid=%s',
-                       values + [bbgid])
+  df = pd.read_csv(opts.file)
+  cols = df.columns
+  if 'exchange' not in cols or 'symbol' not in cols:
+    print('exchange and symbol required in the csv')
+    return
+  try:
+    df.exchange = df.exchange.apply(lambda x: exchanges[x])
+  except KeyError as err:
+    print('Unknown exchange:', err)
+    return
+  if hasattr(df, 'type'):
+    for type in df.type:
+      if type not in types:
+        print('Invalid security type "%s", please choose from %s' %
+              (type, str(types)))
+        return
+  df.rename(columns={'exchange': 'exchange_id'}, inplace=True)
+  cols = df.columns
+  nnew = 0
+  nupdate = 0
+  for index, row in df.iterrows():
+    id = symbols.get(str(row['exchange_id']) + ' ' + row['symbol'])
+    data = [row[c] for c in cols]
+    if id is None:
+      sql = 'insert into security(%s) values(%s)' % (','.join(
+          ['"%s"' % c for c in cols]), ','.join(['?'] * len(cols)))
+      nnew += 1
+    else:
+      data.append(id)
+      sql = 'update security set %s where id=?' % (','.join(
+          ['"%s"=?' % c for c in cols]))
+      nupdate += 1
+    if not is_sqlite: sql = sql.replace('?', '%s')
+    cursor.execute(sql, data)
+
   conn.commit()
+  print('%d updated, %d inserted' % (nupdate, nnew))
 
 
 if __name__ == '__main__':

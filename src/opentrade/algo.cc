@@ -8,9 +8,11 @@
 #include "connection.h"
 #include "cross_engine.h"
 #include "exchange_connectivity.h"
+#include "indicator_handler.h"
 #include "logger.h"
 #include "python.h"
 #include "server.h"
+#include "stop_book.h"
 
 namespace fs = boost::filesystem;
 
@@ -28,16 +30,22 @@ inline void AlgoRunner::operator()() {
       LockGuard lock(mutex_);
       if (dirties_.empty()) return;
       auto it = dirties_.begin();
+      static thread_local uint32_t kSeed = time(NULL);
+      if (dirties_.size() > 1) {
+        auto n = rand_r(&kSeed) % std::min(3lu, dirties_.size());
+        if (n > 0) std::advance(it, n);
+      }
       key = *it;
       dirties_.erase(it);
     }
-    auto md = MarketDataManager::Instance().GetLite(key.second, key.first);
     auto& pair = instruments_[key];
+    auto& insts = pair.second;
+    auto it = insts.begin();
+    if (it == insts.end()) continue;
+    auto md = (*it)->md();
     auto& md0 = pair.first;
     bool trade_update = md0.trade != md.trade;
     bool quote_update = md0.quote() != md.quote();
-    auto& insts = pair.second;
-    auto it = insts.begin();
     while (it != insts.end()) {
       auto& algo = (*it)->algo();
       if (!algo.is_active() || !(*it)->listen()) {
@@ -75,8 +83,7 @@ inline void AlgoManager::Register(Instrument* inst) {
 
 void AlgoManager::Modify(Algo* algo, Algo::ParamMapPtr params) {
   if (!algo || !params) return;
-  strands_[algo->id_ % threads_.size()].post(
-      [params, algo]() { algo->OnModify(*params.get()); });
+  algo->Async([params, algo]() { algo->OnModify(*params.get()); });
 }
 
 Algo* AlgoManager::Spawn(Algo::ParamMapPtr params, const std::string& name,
@@ -89,8 +96,8 @@ Algo* AlgoManager::Spawn(Algo::ParamMapPtr params, const std::string& name,
     algo = static_cast<Algo*>(adapter->Clone());
   } else {
     algo = Python::LoadTest(name, token);
-    if (!algo) return nullptr;
   }
+  if (!algo) return nullptr;
   for (;;) {
     algo->id_ = ++algo_id_counter_;
     // assign python algo on 0th thread, the others shares the other threads
@@ -106,21 +113,47 @@ Algo* AlgoManager::Spawn(Algo::ParamMapPtr params, const std::string& name,
   }
   algo->user_ = &user;
   algo->token_ = token;
+  algo->is_active_ = true;  // for permanent in backtest
   algos_.emplace(algo->id_, algo);
   if (!token.empty()) algo_of_token_.emplace(token, algo);
-  for (auto& pair : *params) {
-    if (auto pval = std::get_if<SecurityTuple>(&pair.second)) {
-      if (pval->acc && pval->sec) {
-        algos_of_sec_acc_.insert(
-            std::make_pair(std::make_pair(pval->sec->id, pval->acc->id), algo));
+  std::string disabled;
+  user.CheckDisabled("user", &disabled);
+  if (params) {
+    for (auto& pair : *params) {
+      if (auto pval = std::get_if<SecurityTuple>(&pair.second)) {
+        if (pval->acc) {
+          if (disabled.empty())
+            pval->acc->CheckDisabled("sub_account", &disabled);
+          if (pval->sec) {
+            if (disabled.empty()) {
+              auto broker =
+                  pval->acc->GetBrokerAccount(pval->sec->exchange->id);
+              if (broker) broker->CheckDisabled("broker_account", &disabled);
+            }
+            if (disabled.empty()) {
+              StopBookManager::Instance().CheckStop(*pval->sec, pval->acc,
+                                                    &disabled);
+            }
+            algos_of_sec_acc_.insert(std::make_pair(
+                std::make_pair(pval->sec->id, pval->acc->id), algo));
+          }
+        }
       }
     }
   }
+  if (dynamic_cast<IndicatorHandler*>(algo)) return algo;
   Persist(*algo, "new", params ? params_raw : "{\"test\":true}");
-  strands_[algo->id_ % threads_.size()].post([params, algo]() {
-    kError = params ? algo->OnStart(*params.get()) : algo->Test();
+  algo->Async([params, algo, disabled]() {
+    if (!disabled.empty()) {
+      kError = disabled;
+    } else {
+      kError = params ? algo->OnStart(*params.get()) : algo->Test();
+    }
     if (!kError.empty()) {
       algo->Stop();
+#ifdef BACKTEST
+      LOG_ERROR(kError);
+#endif
     }
     kError.clear();
   });
@@ -137,7 +170,6 @@ void AlgoManager::Initialize() {
   self.LoadStore();
   self.algo_id_counter_ += 100;
   LOG_INFO("Algo id starts from " << self.algo_id_counter_);
-  self.work_.reset(new boost::asio::io_service::work(self.io_service_));
   self.seq_counter_ += 100;
 }
 
@@ -160,7 +192,7 @@ void AlgoManager::Update(DataSrc::IdType src, Security::IdType id) {
 void AlgoManager::Run(int nthreads) {
 #ifdef BACKTEST
   threads_.resize(1);
-  strands_.resize(1);
+  strands_ = new Strand[1]{};
   runners_ = new AlgoRunner[1]{};
   runners_[0].tid_ = std::this_thread::get_id();
 #else
@@ -168,13 +200,49 @@ void AlgoManager::Run(int nthreads) {
   runners_ = new AlgoRunner[nthreads]{};
   LOG_INFO("algo_threads=" << nthreads);
   threads_.reserve(nthreads);
-  strands_.reserve(nthreads);
+  strands_ = new Strand[nthreads]{};
+  works_.resize(nthreads);
   for (auto i = 0; i < nthreads; ++i) {
-    threads_.emplace_back([this]() { this->io_service_.run(); });
-    strands_.emplace_back(io_service_);
+    strands_[i].io = new boost::asio::io_service;
+    works_[i].reset(new boost::asio::io_service::work(*strands_[i].io));
+    threads_.emplace_back([this, i]() { strands_[i].io->run(); });
     runners_[i].tid_ = threads_[i].get_id();
   }
+  StartPermanents();
 #endif
+}
+
+void AlgoManager::StartPermanents() {
+  for (auto& pair : adapters()) {
+    auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
+    if (pair.first.at(0) != '_' && !ih) continue;
+#ifdef BACKTEST
+    if (ih) {
+      assert(ih->create_func());
+    }
+#endif
+    auto user_name = pair.second->config("user");
+    auto user = AccountManager::Instance().GetUser(user_name);
+    auto algo = Spawn(std::make_shared<Algo::ParamMap>(), pair.first,
+                      user ? *user : kEmptyUser, "{}", "");
+    if (algo) {
+      LOG_INFO("Started " << pair.first << ", algo id=" << algo->id());
+    } else {
+      LOG_ERROR("Failed to start" << pair.first);
+    }
+  }
+
+  for (auto& pair : algos_) {
+    auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
+    if (!ih) continue;
+    IndicatorHandlerManager::Instance().Register(ih);
+  }
+
+  for (auto& pair : algos_) {
+    auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
+    if (!ih) continue;
+    ih->Async([ih]() { ih->OnStart(); });
+  }
 }
 
 void AlgoManager::Handle(Confirmation::Ptr cm) {
@@ -231,7 +299,7 @@ void AlgoManager::Handle(Confirmation::Ptr cm) {
         return;
     }
   }
-  strands_[inst->algo().id() % threads_.size()].post([cm, inst]() {
+  inst->algo().Async([cm, inst]() {
     switch (cm->exec_type) {
       case kPartiallyFilled:
       case kFilled:
@@ -265,26 +333,31 @@ void AlgoManager::Handle(Confirmation::Ptr cm) {
 void AlgoManager::Stop() {
   for (auto& pair : algos_) {
     auto algo = pair.second;
-    strands_[algo->id_ % threads_.size()].post([algo]() { algo->Stop(); });
+    algo->Async([algo]() { algo->Stop(); });
   }
 }
 
 void AlgoManager::Stop(Algo::IdType id) {
   auto algo = FindInMap(algos_, id);
-  if (algo)
-    strands_[algo->id_ % threads_.size()].post([algo]() { algo->Stop(); });
+  if (algo) algo->Async([algo]() { algo->Stop(); });
 }
 
 void AlgoManager::Stop(const std::string& token) {
   auto algo = FindInMap(algo_of_token_, token);
-  if (algo)
-    strands_[algo->id_ % threads_.size()].post([algo]() { algo->Stop(); });
+  if (algo) algo->Async([algo]() { algo->Stop(); });
 }
 
 void AlgoManager::Stop(Security::IdType sec, SubAccount::IdType acc) {
-  auto range = algos_of_sec_acc_.equal_range(std::make_pair(sec, acc));
-  for (auto it = range.first; it != range.second; ++it) {
-    if (it->second->is_active()) Stop(it->second->id());
+  if (sec > 0) {
+    auto range = algos_of_sec_acc_.equal_range(std::make_pair(sec, acc));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second->is_active()) Stop(it->second->id());
+    }
+  } else {
+    for (auto& pair : algos_of_sec_acc_) {
+      if (pair.first.second == acc && pair.second->is_active())
+        Stop(pair.second->id());
+    }
   }
 }
 
@@ -338,7 +411,7 @@ void AlgoManager::LoadStore(uint32_t seq0, Connection* conn) {
     char status[n];
     char body[n];
     *body = 0;
-    if (sscanf(payload, "%d %s %s %[^\1]s", &tm, name, status, body) < 3) {
+    if (sscanf(payload, "%d %s %s %[^\1]", &tm, name, status, body) < 3) {
       LOG_ERROR("Failed to parse algo line #" << ln);
       continue;
     }
@@ -354,49 +427,64 @@ Algo::~Algo() {
   for (auto& inst : instruments_) delete inst;
 }
 
-Instrument* Algo::Subscribe(const Security& sec, DataSrc src, bool listen) {
+Instrument* Algo::Subscribe(const Security& sec, DataSrc src, bool listen,
+                            Instrument* parent) {
+  assert(std::this_thread::get_id() == AlgoManager::Instance().tid(*this));
   auto adapter = MarketDataManager::Instance().Subscribe(sec, src);
   assert(adapter);
   auto inst = new Instrument(this, sec, DataSrc(adapter->src()));
+  inst->parent_ = parent;
+  if (parent)
+    inst->src_idx_ = MarketDataManager::Instance().GetIndex(adapter->src());
   inst->md_ = &MarketDataManager::Instance().Get(sec, adapter->src());
-  inst->id_ = ++Instrument::kIdCounter;
+  inst->id_ = ++Instrument::id_counter_;
   inst->listen_ = listen;
+  std::atomic_thread_fence(std::memory_order_release);
   instruments_.insert(inst);
   if (listen) AlgoManager::Instance().Register(inst);
   return inst;
 }
 
 void Algo::Stop() {
+  assert(std::this_thread::get_id() == AlgoManager::Instance().tid(*this));
   if (is_active_) {
     is_active_ = false;
     for (auto inst : instruments_) inst->Cancel();
     AlgoManager::Instance().Persist(
-        *this, kError.empty() ? "teminated" : "failed", kError);
+        *this, kError.empty() ? "terminated" : "failed", kError);
     OnStop();
   }
 }
 
-void Algo::SetTimeout(std::function<void()> func, double seconds) {
-  AlgoManager::Instance().SetTimeout(id_, func, seconds);
-}
-
-void AlgoManager::SetTimeout(Algo::IdType id, std::function<void()> func,
-                             double seconds) {
+inline void AlgoManager::SetTimeout(const Algo& algo,
+                                    std::function<void()> func,
+                                    double seconds) {
   if (seconds < 0) seconds = 0;
 #ifdef BACKTEST
-  kTimers.emplace(kTime + seconds * 1e6, func);
+  kTimers.emplace(kTime + seconds * kMicroInSec, [&algo, func]() {
+    if (algo.is_active()) func();
+  });
 #else
+  if (seconds <= 0) {
+    strands_[algo.id() % threads_.size()].post(func);
+    return;
+  }
   auto t = new boost::asio::deadline_timer(
-      io_service_, boost::posix_time::microseconds((int64_t)(seconds * 1e6)));
-  t->async_wait(strands_[id % threads_.size()].wrap([func, t](auto) {
-    func();
+      *strands_[algo.id() % threads_.size()].io,
+      boost::posix_time::microseconds((int64_t)(seconds * kMicroInSec)));
+  t->async_wait([&algo, func, t](auto) {
+    if (algo.is_active()) func();
     delete t;
-  }));
+  });
 #endif
 }
 
+void Algo::SetTimeout(std::function<void()> func, double seconds) {
+  AlgoManager::Instance().SetTimeout(*this, func, seconds);
+}
+
 void AlgoManager::Cancel(Instrument* inst) {
-  strands_[inst->algo().id() % threads_.size()].post([=]() { inst->Cancel(); });
+  inst->algo().Async([=]() { inst->Cancel(); });
 }
 
 Order* Algo::Place(const Contract& contract, Instrument* inst) {
@@ -427,12 +515,22 @@ void Algo::Cross(double qty, double price, OrderSide side,
   c.price = price;
   c.sub_account = acc;
   c.type = kCX;
-  auto ord = Place(c, inst);
-  if (ord) CrossEngine::Instance().Place(static_cast<CrossOrder*>(ord));
+  Place(c, inst);
 }
 
 bool Algo::Cancel(const Order& ord) {
   return ExchangeConnectivityManager::Instance().Cancel(ord);
+}
+
+void Instrument::Subscribe(Indicator::IdType id, bool listen) {
+  auto ih = IndicatorHandlerManager::Instance().Get(id);
+  if (ih) ih->Subscribe(this, listen);
+}
+
+void Instrument::SubscribeByName(const std::string& name, bool listen) {
+  auto& m = IndicatorHandlerManager::Instance().name2id();
+  auto it = m.find(name);
+  if (it != m.end()) Subscribe(it->second, listen);
 }
 
 }  // namespace opentrade

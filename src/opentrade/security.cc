@@ -1,5 +1,6 @@
 #include "security.h"
 
+#include <boost/make_shared.hpp>
 #include <cstring>
 #include <unordered_map>
 
@@ -11,69 +12,46 @@ namespace opentrade {
 
 std::string Exchange::ParseTickSizeTable(const std::string& str) {
   if (str.size()) {
-    auto tmp = std::make_shared<TickSizeTable>();
+    auto tmp = boost::make_shared<TickSizeTable>();
     for (auto& str : Split(str, ",;\n")) {
       double low, up, value;
       if (sscanf(str.c_str(), "%lf %lf %lf", &low, &up, &value) == 3) {
         tmp->push_back({low, up, value});
       } else {
         return "Invalid tick size table format, expect '<low_price> <up_price> "
-               "<value>[,;\n]...'";
+               "<value>[,;<new line>]...'";
       }
     }
     if (!tmp->empty()) {
       tmp->shrink_to_fit();
       std::sort(tmp->begin(), tmp->end());
-      std::atomic_thread_fence(std::memory_order_release);
-      tick_size_table_ = tmp;
+      tick_size_table_.store(tmp, boost::memory_order_release);
     }
   }
   return {};
 }
 
-std::string Exchange::ParseTradePeriod(const std::string& str) {
+std::string Exchange::ParsePeriod(const std::string& str, int* start,
+                                  int* end) {
   if (str.empty()) {
-    trade_start = 0;
-    trade_end_ = 0;
+    if (start) *start = 0;
+    if (end) *end = 0;
     return {};
   }
   if (atoi(str.c_str()) > 10000) {  // for back-compactible, will remove
-    auto trade_period = atoi(str.c_str());
-    auto start = trade_period / 10000;
-    auto end = trade_period % 10000;
-    trade_start = (start / 100) * 3600 + (start % 100) * 60;
-    trade_end_ = ((end / 100) * 3600 + (end % 100) * 60);
+    auto period = atoi(str.c_str());
+    auto a = period / 10000;
+    auto b = period % 10000;
+    if (start) *start = (a / 100) * 3600 + (a % 100) * 60;
+    if (end) *end = ((b / 100) * 3600 + (b % 100) * 60);
     return {};
   }
   int a, b, c, d;
   if (sscanf(str.c_str(), "%d:%d-%d:%d", &a, &b, &c, &d) != 4) {
     return "Invalid trade period, expect 'HH:MM-HH:MM'";
   }
-  trade_start = a * 3600 + b * 60;
-  trade_end_ = c * 3600 + d * 60;
-  return {};
-}
-
-std::string Exchange::ParseBreakPeriod(const std::string& str) {
-  if (str.empty()) {
-    break_start = 0;
-    break_end = 0;
-    return {};
-  }
-  if (atoi(str.c_str()) > 10000) {  // for back-compactible, will remove
-    auto break_period = atoi(str.c_str());
-    auto start = break_period / 10000;
-    auto end = break_period % 10000;
-    break_start = (start / 100) * 3600 + (start % 100) * 60;
-    break_end = ((end / 100) * 3600 + (end % 100) * 60);
-    return {};
-  }
-  int a, b, c, d;
-  if (sscanf(str.c_str(), "%d:%d-%d:%d", &a, &b, &c, &d) != 4) {
-    return "Invalid break period, expect 'HH:MM-HH:MM'";
-  }
-  break_start = a * 3600 + b * 60;
-  break_end = c * 3600 + d * 60;
+  if (start) *start = a * 3600 + b * 60;
+  if (end) *end = c * 3600 + d * 60;
   return {};
 }
 
@@ -110,7 +88,7 @@ std::string Exchange::GetTickSizeTableString() const {
 
 std::string Exchange::ParseHalfDays(const std::string& str) {
   if (str.size()) {
-    auto tmp = std::make_shared<HalfDays>();
+    auto tmp = boost::make_shared<HalfDays>();
     for (auto& f : Split(str, ",;\n")) {
       auto i = atoi(f.c_str());
       if (i > 0) {
@@ -118,10 +96,9 @@ std::string Exchange::ParseHalfDays(const std::string& str) {
       }
     }
     if (tmp->empty()) {
-      return "Invalid half days format, expect '<YYYmmdd>[,;\n]...'";
+      return "Invalid half days format, expect '<YYYmmdd>[,;<new line>]...'";
     }
-    std::atomic_thread_fence(std::memory_order_release);
-    half_days_ = tmp;
+    half_days_.store(tmp, boost::memory_order_release);
   }
   return {};
 }
@@ -186,7 +163,7 @@ void SecurityManager::LoadFromDatabase() {
     e->id = id;
     e->name = Database::GetValue(*it, i++, "");
     e->mic = Database::GetValue(*it, i++, "");
-    e->set_params(Database::GetValue(*it, i++, kEmptyStr));
+    e->SetParams(Database::GetValue(*it, i++, kEmptyStr));
     e->country = Database::GetValue(*it, i++, "");
     e->ib_name = Database::GetValue(*it, i++, "");
     e->bb_name = Database::GetValue(*it, i++, "");
@@ -234,6 +211,7 @@ void SecurityManager::LoadFromDatabase() {
       underlying_map[s] = underlying_id;
     }
     s->rate = Database::GetValue(*it, i++, s->rate);
+    if (s->rate > 0 && *s->currency) rates_[s->currency] = s->rate;
     if (s->rate <= 0) s->rate = 1;
     s->multiplier = Database::GetValue(*it, i++, s->multiplier);
     if (s->multiplier <= 0) s->multiplier = 1;
@@ -256,7 +234,7 @@ void SecurityManager::LoadFromDatabase() {
     s->industry_group = Database::GetValue(*it, i++, 0);
     s->industry = Database::GetValue(*it, i++, 0);
     s->sub_industry = Database::GetValue(*it, i++, 0);
-    s->set_params(Database::GetValue(*it, i++, kEmptyStr));
+    s->SetParams(Database::GetValue(*it, i++, kEmptyStr));
     std::atomic_thread_fence(std::memory_order_release);
     securities_.emplace(s->id, s);
   }
@@ -274,7 +252,7 @@ void SecurityManager::UpdateCheckSum() {
   for (auto& pair : securities_) {
     auto s = pair.second;
     ss << pair.first << s->symbol << s->exchange->name << s->type << s->lot_size
-       << s->multiplier;
+       << s->multiplier << s->currency;
   }
   check_sum_ = strdup(sha1(ss.str()).c_str());
 }

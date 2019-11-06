@@ -1,25 +1,48 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
+import optparse
 import pg8000
-
-types = ('STK', 'CASH', 'CMDTY', 'FUT', 'OPT', 'IND', 'FOP', 'WAR', 'BOND',
-         'FUND')
+import sqlite3
+from forex_python.converter import CurrencyRates
+c = CurrencyRates()
 
 
 def main():
-  conn = pg8000.connect(
-      host='127.0.0.1', database='opentrade', user='postgres', password='test')
+  opts = optparse.OptionParser()
+  opts.add_option(
+      '-d',
+      '--db_url',
+      help='sqlite3 file path or postgres url "host,database,user,password"')
+  opts.add_option('', '--dry_run', action='store_true')
+  opts = opts.parse_args()[0]
+
+  rates = c.get_rates('USD')
+  cmds = [
+      "update security set rate={} where currency='{}';".format(1 / rate, cur)
+      for cur, rate in rates.items()
+  ]
+  if opts.dry_run:
+    for cmd in cmds:
+      print(cmd)
+    return
+
+  if not opts.db_url:
+    print('Error: --db_url not give')
+    return
+
+  is_sqlite = False
+  if opts.db_url.endswith('sqlite3'):
+    is_sqlite = True
+    conn = sqlite3.connect(opts.db_url)
+  else:
+    host, database, user, password = opts.db_url.split(',')
+    conn = pg8000.connect(host=host,
+                          database=database,
+                          user=user,
+                          password=password)
 
   cursor = conn.cursor()
-  exchanges = {}
-  cursor.execute(
-      'select symbol, close_price from security where "type"=\'CASH\'')
-  fx = {}
-  for m in cursor.fetchall():
-    if not m[0].startswith('USD'): continue
-    cur = m[0][3:]
-    val = 1 / m[1]
-    cursor.execute('update security set rate=%s where currency=%s', (val, cur))
+  [cursor.execute(cmd) for cmd in cmds]
   conn.commit()
 
 

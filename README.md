@@ -9,8 +9,7 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
 ---
 
 # Features:
-* Built on C++17
-* Strictly follows [Google C++ Style Guild](https://google.github.io/styleguide/cppguide.html)
+* Strictly follows [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)
 * Multi-level account functionality
 * Super simple API interfaces for market data adapter (C++), exchange connectivity (C++) and execution/alpha algo (C++ and Python)
 * **REST** and web socket interface
@@ -25,14 +24,20 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
 * Simple configuration
 * **Internal cross**
 * **Execution Optimization Framework**
+* Order Aggregation
+* Customized indicator extension
+* **Smart Route and FX aggregation**
+* Support both PostgreSQL and Sqlite3
 
 ---
 
 [![Algo Editor](https://github.com/opentradesolutions/opentrade/blob/master/imgs/algo-editor.png)](https://raw.githubusercontent.com/opentradesolutions/opentrade/master/imgs/algo-editor.png)
 
+[![OpenRisk](https://github.com/opentradesolutions/openrisk/blob/master/image.png)](https://raw.githubusercontent.com/opentradesolutions/openrisk/master/image.png)
+
 ---
 
-# Steps to run on Ubuntu 18.04
+# Steps to run on Ubuntu 18.04 or later
 * **Compile**
   * Prepare dev environment.
   ```bash
@@ -58,10 +63,13 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
     libboost-python-dev \
     libsoci-dev \
     libpq-dev \
+    sqlite3 \
+    libsqlite3-dev \
     libquickfix-dev \
     libtbb-dev \
     liblog4cxx-dev
   ```
+
   * Build
   ```bash
   git clone https://github.com/opentradesolutions/opentrade
@@ -69,18 +77,27 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
   make debug
   ```
   
- * **Setup database**
+* **Setup database**
+   * Sqlite3
+   ```bash
+   wget https://github.com/opentradesolutions/data/raw/master/test.sqlite3
+   ```
+
+   * **Or** PostgreSQL
    ```bash
    sudo apt remove --purge postgres*
    sudo apt autoremove
-   sudo apt install -y postgresql-10 postgresql-contrib postgresql-client
+   sudo apt install -y postgresql-10 || sudo apt install -y postgresql-11
+   sudo apt install -y postgresql-contrib postgresql-client
+   # add data to database as user 'postgres'
    sudo su postgres;
    cd;
    wget https://github.com/opentradesolutions/data/raw/master/opentrade-pg_dumpall.sql
-   psql -f opentrade-pg_dumpall.sql 
+   psql -f opentrade-pg_dumpall.sql
+   exit # become yourself again
    ```
  
- * **Run opentrade**
+* **Run opentrade**
    * Download tick data files
    ```bash
    cd opentrade
@@ -92,15 +109,25 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
    ```
    * Run
    ```Bash
+   # please modify opentrade.conf to use postgres if setup database with PostgreSQL
    cp opentrade.conf-example opentrade.conf
    ./opentrade
    ```
    
- * **Open Web UI**
+* **Open Web UI**
    ```
    # username/password: test/test
    http://localhost:9111
    ```
+   
+# CentOS 8
+
+ Please checkout [install_centos.sh](https://github.com/opentradesolutions/opentrade/blob/master/install_centos.sh)
+
+# Internal Latency
+  ```
+  make test-latency
+  ```
    
 # Backtest
   * Only BBO support currently, full orderbook support will come soon
@@ -116,6 +143,7 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
   make args=-j backtest-release
   cd scripts/execution_optimization
   wget https://raw.githubusercontent.com/opentradesolutions/data/master/targets.zip; unzip targets.zip;
+  wget https://github.com/opentradesolutions/data/raw/master/test.sqlite3
   ./run
   ./sim_summary.py rpt*
   ```

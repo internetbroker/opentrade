@@ -5,6 +5,18 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release)
 endif()
 	
+macro(subdirlist result)
+  file(GLOB children ./*)
+  set(dirlist "")
+  foreach(child ${children})
+    if(IS_DIRECTORY ${child})
+      get_filename_component(name ${child} NAME)
+      list(APPEND dirlist ${name})
+    endif()
+  endforeach()
+  set(${result} ${dirlist})
+endmacro()
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -export-dynamic")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -std=c++17")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
@@ -12,6 +24,16 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 if(BACKTEST)
   message(STATUS "Building backtest")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBACKTEST")
+endif()
+
+if(UNIT_TEST)
+  message(STATUS "Building unit_test")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNIT_TEST")
+endif()
+
+if(TEST_LATENCY)
+  message(STATUS "Building test_latency")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTEST_LATENCY")
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -30,12 +52,16 @@ if(PQ_INCLUDE_PATH)
   message(STATUS "Found pq-dev")
   include_directories(${PQ_INCLUDE_PATH}/postgresql)
 else()
-  message(FATAL_ERROR "pq-dev not found.")
+  find_path(PQ_INCLUDE_PATH libpq-fe.h)
+  if(!PQ_INCLUDE_PATH)
+    message(FATAL_ERROR "pq-dev not found.")
+  endif()
 endif()
 
 find_path(SOCI_INCLUDE_PATH soci/soci.h)
 find_library(SOCI_CORE_LIBRARY_PATH soci_core)
 find_library(SOCI_POSTGRES_LIBRARY_PATH soci_postgresql)
+find_library(SOCI_SQLITE3_LIBRARY_PATH soci_sqlite3)
 if(SOCI_INCLUDE_PATH AND SOCI_CORE_LIBRARY_PATH)
   message(STATUS "Found soci")
   include_directories(${SOCI_INCLUDE_PATH}/soci)
@@ -69,9 +95,24 @@ link_libraries(${PYTHON_LIBRARIES}) # Deprecated but so convenient!
 find_package(Boost REQUIRED COMPONENTS system program_options date_time filesystem iostreams python3) 
 include_directories({Boost_INCLUDE_DIRS})
 
+set(EXE_DEPS 
+  ${PROJECT_NAME}_static
+  ${LOG4CXX_LIBRARY_PATH}
+  ${QUICKFIX_LIBRARY_PATH}
+  ${SOCI_CORE_LIBRARY_PATH}
+  ${SOCI_POSTGRES_LIBRARY_PATH}
+  ${SOCI_SQLITE3_LIBRARY_PATH}
+  ${TBB_LIBRARY_PATH}
+  ${Boost_LIBRARIES}
+  dl pthread crypto
+)
+
 add_subdirectory(opentrade)
 add_subdirectory(algos)
 if(NOT BACKTEST)
 add_subdirectory(adapters)
 add_subdirectory(fix)
+endif()
+if(UNIT_TEST)
+add_subdirectory(unit_test)
 endif()

@@ -6,8 +6,7 @@
 
 namespace opentrade {
 
-class ExchangeConnectivityAdapter : public virtual NetworkAdapter {
- public:
+struct ExchangeConnectivityAdapter : public virtual NetworkAdapter {
   virtual std::string Place(const Order& ord) noexcept = 0;
   virtual std::string Cancel(const Order& ord) noexcept = 0;
   void HandleNew(Order::IdType id, const std::string& order_id,
@@ -34,19 +33,14 @@ class ExchangeConnectivityAdapter : public virtual NetworkAdapter {
                     const std::string& text, int64_t transaction_time = 0);
 };
 
-class ExchangeConnectivityManager
-    : public AdapterManager<ExchangeConnectivityAdapter>,
+struct ExchangeConnectivityManager
+    : public AdapterManager<ExchangeConnectivityAdapter, kEcPrefix>,
       public Singleton<ExchangeConnectivityManager> {
- public:
   bool Place(Order* ord);
   bool Cancel(const Order& orig_ord);
-  ExchangeConnectivityAdapter* Get(const std::string& name) {
-    auto out = GetAdapter(name);
-    if (out) return out;
-    return GetAdapter("ec_" + name);
-  }
   void HandleFilled(Order* ord, double qty, double price,
                     const std::string& exec_id);
+  void ClearUnformed(int offset);
 };
 
 }  // namespace opentrade

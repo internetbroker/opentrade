@@ -94,7 +94,6 @@ def on_confirmation(self, confirmation):
 
 
 def timer(self):
-  if not self.is_active: return
   inst = self.inst
   st = self.st
   now = get_time()

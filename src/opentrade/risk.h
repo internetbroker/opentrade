@@ -13,10 +13,12 @@ struct Limits {
   double msg_rate_per_security = 0;  // per security per second
   double order_qty = 0;
   double order_value = 0;
-  double value = 0;     // per security
-  double turnover = 0;  // per security
-  double total_value = 0;
-  double total_turnover = 0;
+  double value = 0;           // intraday per security
+  double turnover = 0;        // intraday per security
+  double total_value = 0;     // intraday
+  double total_turnover = 0;  // intraday
+  double total_long_value = 0;
+  double total_short_value = 0;
   std::string GetString();
   std::string FromString(const std::string& str);
 };

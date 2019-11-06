@@ -6,6 +6,8 @@
 namespace opentrade {
 
 struct PositionValue {
+  double long_value = 0;
+  double short_value = 0;
   double total_bought = 0;
   double total_sold = 0;
   double total_outstanding_buy = 0;

@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "commission.h"
 #include "position_value.h"
 #include "risk.h"
 #include "security.h"
@@ -15,31 +16,48 @@ namespace opentrade {
 class ExchangeConnectivityAdapter;
 
 struct AccountBase {
+  typedef uint16_t IdType;
+  IdType id = 0;
+  const char* name = "";
+  bool is_disabled = false;
   Limits limits;
   Throttle throttle_in_sec;
   tbb::concurrent_unordered_map<Security::IdType, Throttle>
       throttle_per_security_in_sec;
   PositionValue position_value;
+
+  boost::shared_ptr<const std::string> disabled_reason() const {
+    return disabled_reason_.load(boost::memory_order_relaxed);
+  }
+  void set_disabled_reason(boost::shared_ptr<const std::string> v = {}) {
+    disabled_reason_.store(v, boost::memory_order_release);
+  }
+  bool CheckDisabled(const char* name, std::string* err) const;
+
+ private:
+  // different from is_disabled which is persistent in database,
+  // disabled_reason is not persistent and designed for OpenRisk
+  // https://stackoverflow.com/questions/40223599/what-is-the-difference-between-stdshared-ptr-and-stdexperimentalatomic-sha
+  boost::atomic_shared_ptr<const std::string> disabled_reason_;
 };
 
 struct BrokerAccount : public AccountBase, public ParamsBase {
-  typedef uint16_t IdType;
-  IdType id = 0;
-  const char* name = "";
+  std::string SetParams(const std::string& params);
   const char* adapter_name = "";
   ExchangeConnectivityAdapter* adapter = nullptr;
+  const CommissionAdapter* commission_adapter = nullptr;
 };
 
 struct SubAccount : public AccountBase {
-  typedef uint16_t IdType;
-  IdType id = 0;
-  const char* name = "";
   typedef std::unordered_map<Exchange::IdType, const BrokerAccount*>
       BrokerAccountMap;
-  typedef std::shared_ptr<const BrokerAccountMap> BrokerAccountMapPtr;
-  BrokerAccountMapPtr broker_accounts() const { return broker_accounts_; }
+  typedef boost::shared_ptr<const BrokerAccountMap> BrokerAccountMapPtr;
+  BrokerAccountMapPtr broker_accounts() const {
+    return broker_accounts_.load(boost::memory_order_relaxed);
+  }
   void set_broker_accounts(BrokerAccountMapPtr accs) {
-    broker_accounts_ = accs;
+    assert(accs);
+    broker_accounts_.store(accs, boost::memory_order_release);
   }
   const BrokerAccount* GetBrokerAccount(Exchange::IdType id) const {
     assert(id);
@@ -49,28 +67,33 @@ struct SubAccount : public AccountBase {
   }
 
  private:
-  BrokerAccountMapPtr broker_accounts_ = std::make_shared<BrokerAccountMap>();
+  boost::atomic_shared_ptr<const BrokerAccountMap> broker_accounts_ =
+      BrokerAccountMapPtr(new BrokerAccountMap);
 };
 
 struct User : public AccountBase {
-  typedef uint16_t IdType;
-  IdType id = 0;
-  const char* name = "";
   const char* password = "";
   bool is_admin = false;
-  bool is_disabled = false;
   typedef std::unordered_map<SubAccount::IdType, const SubAccount*>
       SubAccountMap;
-  typedef std::shared_ptr<const SubAccountMap> SubAccountMapPtr;
+  typedef boost::shared_ptr<const SubAccountMap> SubAccountMapPtr;
   const SubAccount* GetSubAccount(SubAccount::IdType id) const {
-    return FindInMap(sub_accounts_, id);
+    return FindInMap(sub_accounts(), id);
   }
-  SubAccountMapPtr sub_accounts() const { return sub_accounts_; }
-  void set_sub_accounts(SubAccountMapPtr accs) { sub_accounts_ = accs; }
+  SubAccountMapPtr sub_accounts() const {
+    return sub_accounts_.load(boost::memory_order_relaxed);
+  }
+  void set_sub_accounts(SubAccountMapPtr accs) {
+    assert(accs);
+    sub_accounts_.store(accs, boost::memory_order_release);
+  }
 
  private:
-  SubAccountMapPtr sub_accounts_ = std::make_shared<SubAccountMap>();
+  boost::atomic_shared_ptr<const SubAccountMap> sub_accounts_ =
+      SubAccountMapPtr(new SubAccountMap);
 };
+
+inline const User kEmptyUser;
 
 class AccountManager : public Singleton<AccountManager> {
  public:

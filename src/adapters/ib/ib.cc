@@ -7,8 +7,6 @@
 #include "jts/OrderState.h"
 #include "opentrade/logger.h"
 #include "opentrade/order.h"
-#include "opentrade/security.h"
-#include "opentrade/task_pool.h"
 
 static inline decltype(auto) GetTime(const char* timestr) {
   int y, h, m, s;
@@ -143,11 +141,11 @@ bool IB::Connect(const char* host, unsigned int port, int client_id) {
     LOG_INFO(name() << ": Connected");
     reader_.reset(new EReader(client_, &os_signal_));
     reader_->start();
-    for (auto sec : subs_) Subscribe2(*sec);
+    ReSubscribeAll();
     client_->reqOpenOrders();
     ExecutionFilter f;
     f.m_clientId = client_id;
-    client_->reqExecutions(++ticker_id_counter_, f);
+    client_->reqExecutions(++request_counter_, f);
     Read();
     connected_ = 1;
   } else {
@@ -371,26 +369,18 @@ std::string IB::Cancel(const opentrade::Order& ord) noexcept {
   return {};
 }
 
-void IB::Subscribe2(const opentrade::Security& sec) {
+void IB::SubscribeSync(const opentrade::Security& sec) noexcept {
   LOG_DEBUG(name() << ": reqMktData " << sec.symbol << ' ' << sec.id);
   auto c = CreateContract(sec);
-  auto ticker = ++ticker_id_counter_;
+  auto ticker = ++request_counter_;
   /*
   // snapshot
   client_->reqMktData(ticker, *c, "", true, false, TagValueListSPtr{});
   tickers_[ticker] = sec.id;
-  ticker = ++ticker_id_counter_;
+  ticker = ++request_counter_;
   */
   client_->reqMktData(ticker, *c, "", false, false, TagValueListSPtr{});
   tickers_[ticker] = &sec;
-}
-
-void IB::Subscribe(const opentrade::Security& sec) noexcept {
-  tp_.AddTask([this, &sec]() {
-    if (!subs_.insert(&sec).second) return;
-    if (!client_->isConnected()) return;
-    Subscribe2(sec);
-  });
 }
 
 // https://interactivebrokers.github.io/tws-api/tick_types.html

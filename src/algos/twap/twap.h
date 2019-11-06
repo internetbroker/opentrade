@@ -25,16 +25,34 @@ class TWAP : public Algo {
   void OnConfirmation(const Confirmation& cm) noexcept override;
   const ParamDefs& GetParamDefs() noexcept override;
   void Timer();
+  virtual Instrument* Subscribe();
+  virtual const MarketData& md() { return inst_->md(); }
+  virtual void Place(Contract* c) { Algo::Place(*c, inst_); }
+  virtual double GetLeaves() noexcept;
+  double RoundPrice(double px) {
+    auto tick_size = inst_->sec().GetTickSize(px);
+    if (tick_size > 0) {
+      if (IsBuy(st_.side))
+        px = std::floor(px / tick_size) * tick_size;
+      else
+        px = std::ceil(px / tick_size) * tick_size;
+    }
+    if (px > 100) {
+      px = Round6(px);
+    } else {
+      px = Round8(px);
+    }
+    return px;
+  }
 
- private:
+ protected:
   Instrument* inst_ = nullptr;
-  const SubAccount* acc_ = nullptr;
-  double qty_ = 0;
+  SecurityTuple st_;
   double price_ = 0;
-  OrderSide side_ = kBuy;
   time_t begin_time_ = 0;
   time_t end_time_ = 0;
-  double min_size_ = 0;
+  int min_size_ = 0;
+  int max_floor_ = 0;
   double max_pov_ = 0;
   double initial_volume_ = 0;
   Aggression agg_ = kAggLow;

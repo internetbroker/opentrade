@@ -31,7 +31,7 @@ void AccountManager::Initialize() {
   }
 
   query = R"(
-    select id, "name", limits from sub_account 
+    select id, "name", is_disabled, limits from sub_account 
   )";
   st = sql->prepare << query;
   for (auto it = st.begin(); it != st.end(); ++it) {
@@ -39,13 +39,14 @@ void AccountManager::Initialize() {
     auto i = 0;
     s->id = Database::GetValue(*it, i++, 0);
     s->name = Database::GetValue(*it, i++, "");
+    s->is_disabled = Database::GetValue(*it, i++, 0);
     s->limits.FromString(Database::GetValue(*it, i++, kEmptyStr));
     self.sub_accounts_.emplace(s->id, s);
     self.sub_account_of_name_.emplace(s->name, s);
   }
 
   query = R"(
-    select id, "name", adapter, params, limits from broker_account 
+    select id, "name", adapter, params, is_disabled, limits from broker_account 
   )";
   st = sql->prepare << query;
   for (auto it = st.begin(); it != st.end(); ++it) {
@@ -54,8 +55,10 @@ void AccountManager::Initialize() {
     b->id = Database::GetValue(*it, i++, 0);
     b->name = Database::GetValue(*it, i++, "");
     b->adapter_name = Database::GetValue(*it, i++, "");
-    b->adapter = ExchangeConnectivityManager::Instance().Get(b->adapter_name);
-    b->set_params(Database::GetValue(*it, i++, kEmptyStr));
+    b->adapter =
+        ExchangeConnectivityManager::Instance().GetAdapter(b->adapter_name);
+    b->SetParams(Database::GetValue(*it, i++, kEmptyStr));
+    b->is_disabled = Database::GetValue(*it, i++, 0);
     b->limits.FromString(Database::GetValue(*it, i++, kEmptyStr));
     self.broker_accounts_.emplace(b->id, b);
     self.broker_account_of_name_.emplace(b->name, b);
@@ -103,6 +106,48 @@ void AccountManager::Initialize() {
     pair.first->set_broker_accounts(SubAccount::BrokerAccountMapPtr(
         new decltype(pair.second)(std::move(pair.second))));
   }
+}
+
+std::string BrokerAccount::SetParams(const std::string& params) {
+  auto res = ParamsBase::SetParams(params);
+  if (!res.empty()) return res;
+  auto cm = GetParam("commission");
+  if (cm.empty()) {
+    this->commission_adapter = nullptr;
+    return {};
+  }
+  if (cm.find("=") == std::string::npos) {
+    auto adapter = CommissionManager::Instance().GetAdapter(cm);
+    if (!adapter) return "unknown commission adapter \"" + cm + "\"";
+    this->commission_adapter = adapter;
+    return {};
+  }
+  // memory leak here
+  auto adapter = new CommissionAdapter;
+  res = adapter->SetTable(cm);
+  if (!res.empty()) return res;
+  std::atomic_thread_fence(std::memory_order_release);
+  this->commission_adapter = adapter;
+  return {};
+}
+
+bool AccountBase::CheckDisabled(const char* name, std::string* err) const {
+  char buf[256];
+  if (is_disabled) {
+    snprintf(buf, sizeof(buf), "%s \"%s\" is disabled", name, this->name);
+    *err = buf;
+    return false;
+  }
+
+  auto disabled_reason = this->disabled_reason();
+  if (disabled_reason) {
+    snprintf(buf, sizeof(buf), "%s \"%s\" is disabled by \"%s\"", name,
+             this->name, disabled_reason->c_str());
+    *err = buf;
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace opentrade

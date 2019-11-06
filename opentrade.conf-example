@@ -1,4 +1,5 @@
-db_url=host=127.0.0.1 user=postgres password=test dbname=opentrade
+db_url=test.sqlite3
+#db_url=host=127.0.0.1 user=postgres password=test dbname=opentrade
 
 #[ec_ib]
 #sofile=./libib.so

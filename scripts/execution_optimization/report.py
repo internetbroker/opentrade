@@ -7,7 +7,7 @@ from collections import defaultdict
 
 def main():
   accs = defaultdict(int)
-  for ln in open(os.environ.get('ALGOS', 'algos.txt')):
+  for ln in open(os.environ.get('ALGOS_OUTFILE', 'algos.txt')):
     if ln.startswith('#'): continue
     fds = ln.strip().split(',')
     if len(fds) > 6: accs[fds[6]] += 1
@@ -25,7 +25,7 @@ def report_acc(acc):
   costs = defaultdict(
       lambda: defaultdict(lambda: defaultdict(lambda: [0, 0, 0])))
   attrs = {}
-  for ln in open(os.environ.get('ALGOS', 'algos.txt')):
+  for ln in open(os.environ.get('ALGOS_OUTFILE', 'algos.txt')):
     if ln.startswith('#'): continue
     fds = ln.strip().split(',')
     tm, symbol, side, qty, px, algo_id, acc2, rate, multiplier = fds[:9]
@@ -35,7 +35,7 @@ def report_acc(acc):
     attrs[symbol] = (float(rate), float(multiplier))
   trades = defaultdict(lambda: defaultdict(list))
   rpnl = defaultdict(lambda: [0, 0, 0])
-  for ln in open(os.environ.get('TRADES', 'trades.txt')):
+  for ln in open(os.environ.get('TRADES_OUTFILE', 'trades.txt')):
     fds = ln.strip().split(',')
     tm, symbol, side, qty, px, algo_id = fds[:6]
     if algo_id not in costs[symbol][side]: continue
